@@ -1,5 +1,5 @@
 """Claude Rental plugin for FunPay Cardinal 0.1.17.15.
-Source edition uses sibling rental.py/remail.py. dist/ contains a single-file build.
+Source edition uses sibling helper modules. dist/ contains a single-file build.
 """
 import copy
 import importlib.util
@@ -9,6 +9,7 @@ import os
 from pathlib import Path
 import queue
 import re
+import sqlite3
 import sys
 import tempfile
 import threading
@@ -16,7 +17,7 @@ import time
 from types import ModuleType
 
 NAME = 'Claude Rental'
-VERSION = '0.2.0'
+VERSION = '0.2.1'
 DESCRIPTION = 'Аренда Claude: аккаунты, почта Remail и управление выдачей. Требуется Claude-адаптер.'
 CREDITS = 'Local development'
 UUID = '52280b60-3fd9-4df7-9eb3-f1bb1cd337ef'
@@ -46,10 +47,10 @@ def components():
     sources = globals().get('_EMBEDDED_SOURCES')
     if sources is None:
         sources = {name: Path(__file__).with_name(name + '.py').read_text(encoding='utf-8')
-                   for name in ('remail', 'rental')}
+                   for name in ('remail', 'rental', 'claude_browser_actions')}
     modules = {}
-    for name in ('remail', 'rental'):
-        module_name = '_claude_rental_' + name
+    for name in ('remail', 'rental', 'claude_browser_actions'):
+        module_name = '_claude_rental_browser_actions' if name == 'claude_browser_actions' else '_claude_rental_' + name
         module = ModuleType(module_name)
         sys.modules[module_name] = module
         source = sources[name].replace('from remail import credentials, login_value',
@@ -315,6 +316,11 @@ def register_panel(runtime):
         stage = state['state'][len(state_prefix):]
         value = (m.text or '').strip()
         if stage == 'pickup':
+            links = [e.url for e in (m.entities or []) if e.type == 'text_link' and e.url]
+            if len(links) == 1:
+                value = links[0]
+            elif len(links) > 1:
+                value = ''  # Ask for exactly one URL; never guess which mailbox is intended.
             try:
                 bot.delete_message(m.chat.id, m.id)
             except Exception:
@@ -351,6 +357,16 @@ def register_panel(runtime):
             say(m.chat.id, 'Сохранено. Для применения настроек Claude-адаптера перезапустите Cardinal.'
                 if stage == 'senders' else 'Сохранено.')
             menu(m.chat.id)
+        except runtime.mail.MailError as exc:
+            explanations = {
+                'pickup_host': 'Поддерживаются ссылки remail.best и remail.aishop6.com.',
+                'pickup_email': 'Почта в ссылке не совпадает с введённой. Начните заново через /claude_rental или отправьте ссылку для этой почты.',
+                'pickup_token': 'В ссылке отсутствует token или он указан несколько раз. Скопируйте персональную ссылку целиком.',
+                'pickup_format': 'Отправьте одну полную ссылку HTTPS на страницу /pickup.',
+            }
+            say(m.chat.id, explanations.get(exc.code, 'Не удалось проверить ссылку Remail. Повторите ввод.'))
+        except sqlite3.IntegrityError:
+            say(m.chat.id, 'Эта почта уже добавлена. Откройте «Аккаунты» через /claude_rental.')
         except Exception:
             say(m.chat.id, 'Не удалось сохранить: проверьте формат, совпадение почты и ссылки или наличие дубликата. Повторите ввод или /claude_rental.')
 

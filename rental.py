@@ -62,9 +62,9 @@ class Store:
             c.close()
 
     def add(self, email, pickup):
-        credentials(email, pickup)
+        auth = credentials(email, pickup)
         with self.db() as c:
-            c.execute('INSERT INTO accounts(email,pickup) VALUES (?,?)', (email, pickup))
+            c.execute('INSERT INTO accounts(email,pickup) VALUES (?,?)', (email, auth.pickup_url()))
 
     def usage(self, account_id, five, seven, now=None):
         now = time.time() if now is None else now

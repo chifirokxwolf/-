@@ -123,6 +123,34 @@ class CardinalIntegrationTests(unittest.TestCase):
         self.assertNotIn('998877', self.output())
         self.assertIsNone(self.tg.get_state(1, 1))
 
+    def test_add_best_link_and_display_specific_validation_errors(self):
+        self.click('add')
+        self.dispatch('test@example.org')
+        self.dispatch('https://remail.best/pickup?email=wrong%40example.org&token=LOCAL-SECRET')
+        self.assertIn('Почта в ссылке не совпадает', self.output())
+        self.assertEqual(len(self.runtime.store.accounts()), 0)
+        self.dispatch('[Почта](https://remail.best/pickup?email=test%40example.org\\&token=LOCAL-SECRET)')
+        account = self.runtime.store.accounts()[0]
+        self.assertTrue(account['pickup'].startswith('https://remail.best/pickup?'))
+        self.click('add')
+        self.dispatch('test@example.org')
+        self.dispatch('https://remail.best/pickup?email=test%40example.org&token=LOCAL-SECRET')
+        self.assertIn('Эта почта уже добавлена', self.output())
+        self.assertNotIn('LOCAL-SECRET', self.output())
+
+    def test_telegram_hidden_hyperlink_is_accepted(self):
+        self.click('add')
+        self.dispatch('test@example.org')
+        message = self.message('Почта')
+        message.entities = [self.types.MessageEntity('text_link', 0, 5,
+            url='https://remail.best/pickup?email=test%40example.org&token=LOCAL-SECRET')]
+        for handler in self.tg.bot.message_handlers:
+            if self.tg.bot._test_message_handler(handler, message):
+                handler['function'](message)
+                break
+        self.assertEqual(len(self.runtime.store.accounts()), 1)
+        self.assertNotIn('LOCAL-SECRET', self.output())
+
     def test_unauthorized_and_group_access_are_denied(self):
         self.dispatch('/claude_rental', user=2)
         self.click('add', user=2)

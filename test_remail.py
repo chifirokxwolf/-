@@ -68,6 +68,43 @@ class Opener:
 
 
 class ApiTests(unittest.TestCase):
+    def test_best_domain_keeps_both_api_calls_on_the_original_host(self):
+        account = {**ACCOUNT, 'pickup': ACCOUNT['pickup'].replace('remail.aishop6.com', 'remail.best')}
+        opener = Opener({'items': [], 'fetch': {}})
+        client = Client(account, opener=opener)
+        client.pickup()
+        opener.response = msg(5012)
+        client.message(5012)
+        for request, _ in opener.calls:
+            self.assertEqual(urlsplit(request.full_url).netloc, 'remail.best')
+            self.assertEqual(parse_qs(urlsplit(request.full_url).query)['token'], ['local-fixture+&'])
+
+    def test_chat_link_formats_are_normalized_without_changing_mailbox(self):
+        plain = ACCOUNT['pickup'].replace('remail.aishop6.com', 'remail.best')
+        for value in [plain, f'[{plain}]({plain})', '<' + plain + '>',
+                      plain.replace('&token=', '\\&token='), plain.replace('&token=', '&amp;token=')]:
+            auth = credentials(ACCOUNT['email'], value)
+            self.assertEqual(auth.email, ACCOUNT['email'])
+            self.assertEqual(auth.token, 'local-fixture+&')
+            self.assertEqual(urlsplit(auth.pickup_url()).netloc, 'remail.best')
+        with self.assertRaises(MailError):
+            credentials(ACCOUNT['email'], f'[one]({plain}) [two]({plain})')
+
+    def test_domain_allowlist_does_not_accept_similar_hosts_or_credentials(self):
+        for host in ['remail.best.attacker.example', 'remail.best@attacker.example',
+                     'attacker@remail.best', '127.0.0.1', 'remail.best:444']:
+            with self.assertRaises(MailError):
+                credentials(ACCOUNT['email'], ACCOUNT['pickup'].replace('remail.aishop6.com', host))
+
+    def test_email_and_token_errors_have_safe_distinct_codes(self):
+        cases = [('other@example.org', ACCOUNT['pickup'], 'pickup_email'),
+                 (ACCOUNT['email'], ACCOUNT['pickup'].split('&token=')[0], 'pickup_token')]
+        for email, link, code in cases:
+            with self.assertRaises(MailError) as caught:
+                credentials(email, link)
+            self.assertEqual(caught.exception.code, code)
+            self.assertNotIn('local-fixture', str(caught.exception))
+
     def test_both_documented_endpoints_encode_original_credentials(self):
         opener = Opener({'items': [], 'fetch': {'lastStatus': 'pending'}})
         client = Client(ACCOUNT, opener=opener)

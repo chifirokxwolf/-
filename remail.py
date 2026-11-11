@@ -17,36 +17,62 @@ from urllib.parse import parse_qs, urlencode, urlsplit
 from urllib.request import HTTPRedirectHandler, Request, build_opener
 
 BASE_URL = 'https://remail.aishop6.com'
+PICKUP_HOSTS = frozenset(('remail.aishop6.com', 'remail.best'))
 
 
 class MailError(Exception):
     """Safe to display: never includes an HTTP URL or response body."""
-    def __init__(self, message, *, retryable=False, retry_after=0):
+    def __init__(self, message, *, retryable=False, retry_after=0, code='mail_error'):
         super().__init__(message)
         self.retryable = retryable
         self.retry_after = retry_after
+        self.code = code
 
 
 @dataclass(frozen=True, repr=False)
 class Credentials:
     email: str
     token: str
+    base_url: str = BASE_URL
+
+    def pickup_url(self):
+        return self.base_url + '/pickup?' + urlencode({'email': self.email, 'token': self.token})
+
+
+def normalize_pickup(value):
+    if not isinstance(value, str):
+        raise MailError('Paste one complete Remail link', code='pickup_format')
+    value = value.strip()
+    # Accept a single Markdown link copied from chat, without evaluating its label.
+    markdown = re.fullmatch(r'\[[^\[\]\r\n]*\]\((https://[^\s]+)\)', value)
+    if markdown:
+        value = markdown.group(1)
+    if value.startswith('<') and value.endswith('>'):
+        value = value[1:-1]
+    value = value.replace('\\&', '&').replace('&amp;', '&')
+    if not value or any(c.isspace() or ord(c) < 32 for c in value):
+        raise MailError('Paste one complete Remail link', code='pickup_format')
+    return value
 
 
 def credentials(email, pickup):
+    pickup = normalize_pickup(pickup)
     try:
         u = urlsplit(pickup)
         q = parse_qs(u.query, keep_blank_values=True)
-        valid = (u.scheme == 'https' and u.hostname == 'remail.aishop6.com'
-                 and u.port in (None, 443) and not u.username and not u.password
-                 and u.path == '/pickup' and not u.fragment
-                 and q.get('email') == [email] and len(q.get('token', [])) == 1
-                 and bool(q['token'][0]) and '@' in email)
+        valid = (u.scheme == 'https' and u.port in (None, 443)
+                 and not u.username and not u.password and u.path == '/pickup' and not u.fragment)
     except (ValueError, TypeError):
         valid = False
     if not valid:
-        raise MailError('Pickup URL must contain the exact account email and one nonempty token')
-    return Credentials(email, q['token'][0])
+        raise MailError('Expected an HTTPS Remail /pickup link', code='pickup_format')
+    if u.hostname not in PICKUP_HOSTS:
+        raise MailError('Unsupported Remail domain', code='pickup_host')
+    if q.get('email') != [email] or not isinstance(email, str) or '@' not in email:
+        raise MailError('Account email does not match the link', code='pickup_email')
+    if len(q.get('token', [])) != 1 or not q['token'][0]:
+        raise MailError('Link must contain one nonempty token', code='pickup_token')
+    return Credentials(email, q['token'][0], 'https://' + u.hostname)
 
 
 def timestamp(value):
@@ -117,7 +143,7 @@ class Client:
 
     def _get(self, path, timeout=15):
         query = urlencode({'email': self.auth.email, 'token': self.auth.token})
-        req = Request(f'{BASE_URL}{path}?{query}', headers={'Accept': 'application/json'})
+        req = Request(f'{self.auth.base_url}{path}?{query}', headers={'Accept': 'application/json'})
         try:
             with self.opener.open(req, timeout=timeout) as response:
                 raw = response.read(2 * 1024 * 1024 + 1)
