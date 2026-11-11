@@ -1,5 +1,11 @@
 # Первый вход в Claude на Windows
 
+**При бесконечной проверке Cloudflare в Chromium используйте
+[новый ручной запуск Chrome/Edge](CLAUDE_MANUAL_LOGIN_RU.md).** Установленный
+браузер открывается без Playwright, с отдельным профилем. Архив для этого шага:
+[`claude-windows-login-0.3.1.zip`](https://github.com/chifirokxwolf/-/raw/refs/heads/main/dist/claude-windows-login-0.3.1.zip).
+Ниже сохранены инструкции к первоначальному инструменту 0.3.0.
+
 Для подключения нужны работающий Cardinal на Windows, Python из его установки,
 доступ к `claude.ai` с этого компьютера и один ваш тестовый аккаунт с почтой/Remail.
 Первый вход выполняется в видимом браузере. Если сервис запросит подтверждение,

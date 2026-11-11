@@ -3,6 +3,16 @@ from pathlib import Path
 import zipfile
 
 
+def build_manual_login(root=None):
+    root = Path(root or Path(__file__).parent)
+    target = root / 'dist' / 'claude-windows-login-0.3.1.zip'
+    target.parent.mkdir(exist_ok=True)
+    with zipfile.ZipFile(target, 'w', zipfile.ZIP_DEFLATED) as z:
+        for name in ('tools/claude_manual_login.py', 'tools/open_claude_manual.cmd', 'CLAUDE_MANUAL_LOGIN_RU.md'):
+            z.write(root / name, name)
+    return target
+
+
 def build(root=None):
     root = Path(root or Path(__file__).parent)
     sources = {name: (root / (name + '.py')).read_text(encoding='utf-8')
