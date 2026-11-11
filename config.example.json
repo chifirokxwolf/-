@@ -2,6 +2,7 @@
   "database": "storage/claude_rental/rentals.sqlite3",
   "claude_provider_file": "",
   "enabled": false,
+  "rules_schema": 1,
   "mailbox": {
     "allowed_senders": [],
     "poll_seconds": 5,
@@ -9,9 +10,39 @@
   },
   "rules": [
     {
-      "pattern": "(?i)Claude PRO.*НА 5 ЧАСОВ.*АРЕНДА",
-      "hours": 5,
-      "quantity_is_duration": false
+      "label": "Claude — 30 минут",
+      "pattern": "(?i)(?=.*\\bClaude\\b)(?=.*\\bаренда\\b).*\\b(?:на|аренда)\\s*30\\s*мин(?:ут(?:а|ы)?)?\\b",
+      "minutes": 30,
+      "quantity_is_duration": true,
+      "check_paid_term": true
+    },
+    {
+      "label": "Claude — 1 час",
+      "pattern": "(?i)(?=.*\\bClaude\\b)(?=.*\\bаренда\\b).*\\b(?:на|аренда)\\s*1\\s*час(?:а|ов)?\\b",
+      "minutes": 60,
+      "quantity_is_duration": true,
+      "check_paid_term": true
+    },
+    {
+      "label": "Claude — 2 часа",
+      "pattern": "(?i)(?=.*\\bClaude\\b)(?=.*\\bаренда\\b).*\\b(?:на|аренда)\\s*2\\s*час(?:а|ов)?\\b",
+      "minutes": 120,
+      "quantity_is_duration": true,
+      "check_paid_term": true
+    },
+    {
+      "label": "Claude — 3 часа",
+      "pattern": "(?i)(?=.*\\bClaude\\b)(?=.*\\bаренда\\b).*\\b(?:на|аренда)\\s*3\\s*час(?:а|ов)?\\b",
+      "minutes": 180,
+      "quantity_is_duration": true,
+      "check_paid_term": true
+    },
+    {
+      "label": "Claude — 5 часов",
+      "pattern": "(?i)(?=.*\\bClaude\\b)(?=.*\\bаренда\\b).*\\b(?:на|аренда)\\s*5\\s*час(?:а|ов)?\\b",
+      "minutes": 300,
+      "quantity_is_duration": true,
+      "check_paid_term": true
     }
   ]
 }

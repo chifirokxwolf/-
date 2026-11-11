@@ -43,7 +43,7 @@ class RentalTests(unittest.TestCase):
         self.assertTrue(engine.deliver('a', 'buyer', 'chat', 18000))
         restarted = Engine(Store(self.store.path), Provider(), engine.send)
         self.assertFalse(restarted.deliver('a', 'buyer', 'chat', 18000))
-        self.assertEqual(len(messages), 1)
+        self.assertEqual(len(messages), 2)  # Greeting, then the one-time code.
         with self.assertRaises(ValueError):
             restarted.deliver('a', 'other', 'chat', 18000)
 
@@ -125,7 +125,8 @@ class RentalTests(unittest.TestCase):
         engine = Engine(self.store, provider, lambda *args: messages.append(args) or True)
         self.assertTrue(engine.deliver('a', 'b', 'chat', 18000))
         self.assertEqual(messages[0][0], 'chat')
-        self.assertIn('012345', messages[0][1])
+        self.assertNotIn('012345', messages[0][1])
+        self.assertIn('012345', messages[1][1])
         self.assertNotIn('fixture', messages[0][1])
         self.assertNotIn('remail', messages[0][1])
 

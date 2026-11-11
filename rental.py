@@ -9,11 +9,22 @@ import os
 from pathlib import Path
 import sqlite3
 import time
+from datetime import datetime, timedelta, timezone
 from remail import credentials, login_value
 
 
 class Unavailable(Exception):
     pass
+
+
+def format_duration(seconds):
+    hours, rest = divmod(seconds, 3600)
+    minutes, seconds = divmod(rest, 60)
+    return ' '.join(f'{v} {unit}' for v, unit in ((hours, 'ч'), (minutes, 'мин'), (seconds, 'сек')) if v)
+
+
+def end_time(timestamp):
+    return datetime.fromtimestamp(timestamp, timezone(timedelta(hours=3))).strftime('%d.%m %H:%M МСК')
 
 
 class Store:
@@ -42,9 +53,25 @@ class Store:
                     message_id INTEGER NOT NULL,
                     order_id TEXT NOT NULL UNIQUE REFERENCES rentals(order_id),
                     PRIMARY KEY(account_id, message_id));
+                CREATE TABLE IF NOT EXISTS purchases (
+                    order_id TEXT PRIMARY KEY, buyer TEXT NOT NULL, chat TEXT NOT NULL,
+                    seconds INTEGER NOT NULL, kind TEXT NOT NULL DEFAULT 'pending',
+                    rental_id TEXT REFERENCES rentals(order_id), created REAL NOT NULL);
+                CREATE TABLE IF NOT EXISTS buyers (
+                    buyer TEXT PRIMARY KEY, first_order_id TEXT NOT NULL UNIQUE,
+                    bonus_state TEXT NOT NULL DEFAULT 'pending');
             ''')
             if 'disabled' not in {r[1] for r in c.execute('PRAGMA table_info(accounts)')}:
                 c.execute('ALTER TABLE accounts ADD COLUMN disabled INTEGER NOT NULL DEFAULT 0')
+            if 'reminder_expires' not in {r[1] for r in c.execute('PRAGMA table_info(rentals)')}:
+                c.execute('ALTER TABLE rentals ADD COLUMN reminder_expires REAL')
+            if 'bonus_deadline' not in {r[1] for r in c.execute('PRAGMA table_info(rentals)')}:
+                c.execute('ALTER TABLE rentals ADD COLUMN bonus_deadline REAL')
+                c.execute('UPDATE rentals SET bonus_deadline=expires')
+            c.execute('''INSERT OR IGNORE INTO purchases(order_id,buyer,chat,seconds,kind,rental_id,created)
+                SELECT order_id,buyer,chat,seconds,'initial',order_id,0 FROM rentals ORDER BY rowid''')
+            c.execute('''INSERT OR IGNORE INTO buyers(buyer,first_order_id)
+                SELECT buyer,order_id FROM purchases ORDER BY rowid''')
 
     @contextmanager
     def db(self):
@@ -83,25 +110,104 @@ class Store:
         with self.db() as c:
             c.execute("UPDATE accounts SET state='hold',checked=NULL WHERE id=? AND state='quarantine'", (account_id,))
 
+    @staticmethod
+    def _record(c, order_id, buyer, chat, seconds, now):
+        if type(seconds) is not int or not 0 < seconds <= 31 * 86400:
+            raise ValueError('Invalid rental duration')
+        order_id, buyer, chat = str(order_id), str(buyer), str(chat)
+        c.execute('INSERT OR IGNORE INTO purchases(order_id,buyer,chat,seconds,created) VALUES (?,?,?,?,?)',
+                  (order_id, buyer, chat, seconds, now))
+        p = c.execute('SELECT * FROM purchases WHERE order_id=?', (order_id,)).fetchone()
+        if (p['buyer'], p['chat'], p['seconds']) != (buyer, chat, seconds):
+            raise ValueError('Order parameters mismatch')
+        c.execute('INSERT OR IGNORE INTO buyers(buyer,first_order_id) VALUES (?,?)', (buyer, order_id))
+        return dict(p)
+
+    def record_purchase(self, order_id, buyer, chat, seconds, now=None):
+        with self.db() as c:
+            return self._record(c, order_id, buyer, chat, seconds, time.time() if now is None else now)
+
+    def renew(self, order_id, buyer, chat, seconds, now=None):
+        now = time.time() if now is None else now
+        with self.db() as c:
+            p = self._record(c, order_id, buyer, chat, seconds, now)
+            if p['kind'] != 'pending':
+                return {'duplicate': True}
+            leases = c.execute("SELECT * FROM rentals WHERE buyer=? AND state!='closed' AND expires>?",
+                               (str(buyer), now)).fetchall()
+            if not leases:
+                return None
+            if len(leases) != 1 or leases[0]['state'] != 'active':
+                raise Unavailable('Previous rental is not ready for renewal')
+            r = leases[0]
+            expires = r['expires'] + seconds
+            c.execute('UPDATE rentals SET expires=?,seconds=seconds+? WHERE order_id=?', (expires, seconds, r['order_id']))
+            c.execute("UPDATE purchases SET kind='extension',rental_id=? WHERE order_id=?", (r['order_id'], str(order_id)))
+            return {'duplicate': False, 'expires': expires, 'account_id': r['account_id']}
+
+    def is_first_purchase(self, order_id, buyer):
+        with self.db() as c:
+            r = c.execute('SELECT first_order_id FROM buyers WHERE buyer=?', (str(buyer),)).fetchone()
+            return r is not None and r[0] == str(order_id)
+
+    def award_review_bonus(self, order_id, buyer, now=None):
+        now = time.time() if now is None else now
+        with self.db() as c:
+            b = c.execute('SELECT * FROM buyers WHERE buyer=?', (str(buyer),)).fetchone()
+            if not b or b['first_order_id'] != str(order_id) or b['bonus_state'] != 'pending':
+                return None
+            r = c.execute('SELECT * FROM rentals WHERE order_id=? AND buyer=?', (str(order_id), str(buyer))).fetchone()
+            if not r or (r['state'] == 'issuing' and r['expires'] > now):
+                return None
+            eligible = r['state'] == 'active' and min(r['expires'], r['bonus_deadline'] or r['expires']) > now
+            state = 'awarded' if eligible else 'too_late'
+            c.execute('UPDATE buyers SET bonus_state=? WHERE buyer=?', (state, str(buyer)))
+            if eligible:
+                c.execute('UPDATE rentals SET expires=expires+3600,seconds=seconds+3600 WHERE order_id=?', (str(order_id),))
+            return {'state': state, 'chat': r['chat'], 'expires': r['expires'] + (3600 if eligible else 0)}
+
+    def review_candidates(self):
+        with self.db() as c:
+            return [r[0] for r in c.execute('''SELECT b.first_order_id FROM buyers b JOIN rentals r
+                ON r.order_id=b.first_order_id WHERE b.bonus_state='pending' AND r.state='active'
+                AND r.bonus_deadline>? ORDER BY r.rowid''', (time.time(),))]
+
+    def claim_reminders(self, now=None, lead_seconds=900):
+        now = time.time() if now is None else now
+        with self.db() as c:
+            rows = [dict(r) for r in c.execute('''SELECT order_id,chat,expires FROM rentals
+                WHERE state='active' AND expires>? AND expires<=?
+                AND (reminder_expires IS NULL OR reminder_expires!=expires)''', (now, now + lead_seconds))]
+            for r in rows:
+                c.execute('UPDATE rentals SET reminder_expires=? WHERE order_id=?', (r['expires'], r['order_id']))
+            return rows
+
     def reserve(self, order_id, buyer, chat, seconds, now=None):
         now = time.time() if now is None else now
         if type(seconds) is not int or not 0 < seconds <= 31 * 86400:
             raise ValueError('Invalid rental duration')
         with self.db() as c:
+            p = self._record(c, order_id, buyer, chat, seconds, now)
             old = c.execute('SELECT * FROM rentals WHERE order_id=?', (order_id,)).fetchone()
             if old:
                 if old['buyer'] != str(buyer) or old['chat'] != str(chat):
                     raise ValueError('Order owner mismatch')
                 return None  # Duplicate events never issue another login code.
+            if p['kind'] != 'pending':
+                return None
+            if c.execute("SELECT 1 FROM rentals WHERE buyer=? AND state!='closed' AND expires>?",
+                         (str(buyer), now)).fetchone():
+                raise Unavailable('Buyer already has an active rental; renew it instead')
             a = c.execute('''SELECT * FROM accounts a WHERE state='ready' AND disabled=0
                 AND checked BETWEEN ? AND ? AND five<=70 AND seven<=70
                 AND NOT EXISTS (SELECT 1 FROM rentals r WHERE r.account_id=a.id AND r.state!='closed')
                 ORDER BY MAX(five,seven),id LIMIT 1''', (now - 120, now)).fetchone()
             if not a:
                 raise Unavailable('No account with fresh usage and confirmed session cleanup')
-            c.execute('INSERT INTO rentals VALUES (?,?,?,?,?,?,?,?)',
+            c.execute('INSERT INTO rentals(order_id,buyer,chat,account_id,seconds,state,expires,code_hash) VALUES (?,?,?,?,?,?,?,?)',
                       (str(order_id), str(buyer), str(chat), a['id'], seconds,
                        'issuing', now + seconds, None))
+            c.execute("UPDATE purchases SET kind='initial',rental_id=? WHERE order_id=?", (str(order_id), str(order_id)))
             return dict(a)
 
     def claim_code(self, order_id, code):
@@ -130,8 +236,8 @@ class Store:
     def active(self, order_id, now=None):
         now = time.time() if now is None else now
         with self.db() as c:
-            c.execute("UPDATE rentals SET state='active',expires=?+seconds WHERE order_id=? AND state='issuing'",
-                      (now, order_id))
+            c.execute("UPDATE rentals SET state='active',expires=?+seconds,bonus_deadline=?+seconds WHERE order_id=? AND state='issuing'",
+                      (now, now, order_id))
 
     def pending_cleanup(self, now=None):
         now = time.time() if now is None else now
@@ -164,7 +270,7 @@ class Store:
 
     def recent_rentals(self):
         with self.db() as c:
-            return [dict(r) for r in c.execute('''SELECT order_id,account_id,state,expires
+            return [dict(r) for r in c.execute('''SELECT order_id,account_id,state,expires,seconds
                 FROM rentals ORDER BY rowid DESC LIMIT 20''')]
 
 
@@ -194,15 +300,67 @@ class Engine:
                 self.store.hold(a['id'])
 
     def deliver(self, order_id, buyer, chat, seconds):
+        renewal = self.store.renew(order_id, buyer, chat, seconds)
+        if renewal is not None:
+            if renewal.get('duplicate'):
+                return False
+            self.notify_renewal(chat, seconds, renewal)
+            return True
         a = self.store.reserve(order_id, buyer, chat, seconds)
         if a is None:
             return False
+        first = self.store.is_first_purchase(order_id, buyer)
+        greeting = (f'Здравствуйте! Спасибо за покупку. Аренда Claude: {format_duration(seconds)}.\n'
+                    f'Ваша почта: {a["email"]}\nКод или ссылка входа выдаётся только один раз на эту аренду. '
+                    'Сейчас подготовлю вход. При продлении новый код не нужен.')
+        if first:
+            greeting += ('\nЭто ваша первая покупка: +1 час за отзыв к этому заказу, '
+                         'если бот подтвердит его до окончания первоначального срока аренды. Оставьте отзыв сразу; '
+                         'позже бонус не начисляется. Продление не увеличивает срок для получения бонуса.')
+        else:
+            greeting += '\nБонус за отзыв действует только при первой покупке.'
+        if not self.send(chat, greeting):
+            raise Unavailable('Greeting unconfirmed; account remains reserved')
         # On exception or crash leave issuing until expiry and verified cleanup.
         code = self.store.claim_code(order_id, self.provider.issue(a, order_id))
-        if not self.send(chat, f"Аренда Claude: {seconds // 3600} ч.\nПочта: {a['email']}\nВход: {code}"):
+        if not self.send(chat, f"Вход: {code}\nСрок: {format_duration(seconds)}. Код выдан один раз; повторной выдачи нет."):
             raise Unavailable('Delivery unconfirmed; account remains reserved')
         self.store.active(order_id)
         return True
+
+    def notify_renewal(self, chat, seconds, renewal):
+        if not self.send(chat, f'Аренда продлена на {format_duration(seconds)}. Окончание: {end_time(renewal["expires"])}. '
+                         'Оставайтесь в том же аккаунте: новый код при продлении не выдаётся.'):
+            raise Unavailable('Rental extended, notification unconfirmed')
+
+    def remind(self):
+        failed = False
+        for r in self.store.claim_reminders():
+            with self.store.db() as c:
+                current = c.execute("SELECT 1 FROM rentals WHERE order_id=? AND state='active' AND expires=? AND expires>?",
+                                    (r['order_id'], r['expires'], time.time())).fetchone()
+            if not current:
+                continue
+            minutes = max(1, math.ceil((r['expires'] - time.time()) / 60))
+            try:
+                if not self.send(r['chat'], f'Аренда заканчивается примерно через {minutes} мин — {end_time(r["expires"])}. '
+                                 'Для продления до окончания аренды купите лот на нужный срок. Время добавится к текущему аккаунту, новый код не нужен.'):
+                    failed = True
+            except Exception:
+                failed = True
+        if failed:
+            raise Unavailable('Some reminder deliveries were not confirmed')
+
+    def apply_review(self, order_id, buyer):
+        result = self.store.award_review_bonus(order_id, buyer)
+        if result:
+            text = (f'Спасибо за отзыв к первой покупке! Начислен +1 час. Окончание: {end_time(result["expires"])}.'
+                    if result['state'] == 'awarded' else
+                    'Отзыв подтверждён после первоначального срока первой аренды: бонусный час не начислен. '
+                    'Оставлять отзыв нужно сразу; продление не увеличивает срок для бонуса.')
+            if not self.send(result['chat'], text):
+                raise Unavailable('Review processed, notification unconfirmed')
+        return result
 
 
 def main():
