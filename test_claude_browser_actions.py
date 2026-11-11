@@ -61,6 +61,28 @@ class BrowserLogoutTests(unittest.TestCase):
             self.perform()
         self.assertEqual(self.page.locator('body').get_attribute('data-clicked'), '0')
 
+    def test_settings_dialog_and_delayed_confirmation_are_separate(self):
+        html = '''<body data-revoked="0"><section role="dialog" aria-label="Settings">
+            <span data-testid="account">fixture@example.org</span>
+            <button onclick="setTimeout(() => document.querySelector('#confirmation').showModal(), 100)">Log out of all devices</button>
+            </section><dialog id="confirmation"><h2>Log out of all devices</h2><p>Are you sure?</p>
+            <button onclick="document.body.dataset.revoked='1';this.parentElement.close()">Log out of all devices</button>
+            <button>Cancel</button></dialog></body>'''
+        self.context.route('**/*', lambda route: route.fulfill(status=200, content_type='text/html', body=html))
+        self.page.goto('https://claude.ai/new#settings/account')
+        self.assertTrue(self.perform())
+
+    def test_unconfirmed_exit_inside_settings_is_not_clicked_twice(self):
+        html = '''<body data-clicks="0" data-revoked="0"><section role="dialog" aria-label="Settings">
+            <span data-testid="account">fixture@example.org</span>
+            <button onclick="document.body.dataset.clicks=String(Number(document.body.dataset.clicks)+1)">Log out of all devices</button>
+            </section></body>'''
+        self.context.route('**/*', lambda route: route.fulfill(status=200, content_type='text/html', body=html))
+        self.page.goto('https://claude.ai/new#settings/account')
+        with self.assertRaises(LogoutError):
+            self.perform()
+        self.assertEqual(self.page.locator('body').get_attribute('data-clicks'), '1')
+
     def test_unknown_language_and_duplicate_actions_fail_closed(self):
         for label, duplicate in [('Unrecognized global exit', False), ('Выйти везде', True)]:
             self.context.unroute('**/*')

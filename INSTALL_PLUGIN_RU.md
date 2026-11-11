@@ -1,4 +1,8 @@
-# Claude Rental 0.3.0 для FunPay Cardinal 0.1.17.15
+# Claude Rental 0.3.2 для FunPay Cardinal 0.1.17.15
+
+В 0.3.2 исправлен поиск подтверждения «Выйти везде» поверх окна Settings.
+Добавлена отдельная проверка чтения лимитов из профиля Edge/Chrome:
+`CLAUDE_BROWSER_CHECK_RU.md`. Эта проверка не включает автоматические продажи.
 
 В обновлении: точные сроки пяти лотов, умножение на количество, продление того же
 аккаунта, память покупателей, один бонусный час за отзыв к первой покупке,
@@ -14,7 +18,7 @@
 
 ## Скачать и установить
 
-- [ZIP с плагином и инструкцией](https://github.com/chifirokxwolf/-/raw/refs/heads/main/dist/claude-rental-plugin-0.3.0.zip).
+- [ZIP с плагином и инструкцией](https://github.com/chifirokxwolf/-/raw/refs/heads/main/dist/claude-rental-plugin-0.3.2.zip).
 - [Готовый Python-файл](https://github.com/chifirokxwolf/-/raw/refs/heads/main/dist/claude_rental_plugin.py).
 
 1. Сохраните резервную копию `storage/claude_rental/` при остановленном Cardinal.
@@ -23,7 +27,7 @@
    `/upload_plugin` и отправьте этот `.py` как документ с прежним именем.
    ZIP целиком команда не принимает. При обновлении замените прежний файл.
 4. Выполните `/restart`, затем **`/claude_rental`**.
-5. В заголовке должно быть **Claude Rental 0.3.0**. Меню также доступно через
+5. В заголовке должно быть **Claude Rental 0.3.2**. Меню также доступно через
    **Плагины → Claude Rental → Настройки**.
 
 Можно заменить файл вручную в папке `plugins/` при остановленном Cardinal.

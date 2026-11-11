@@ -59,19 +59,26 @@ def logout_everywhere(page, *, verify_account, verify_revoked, timeout_ms=10000)
             raise LogoutError('Account identity was not confirmed')
         if not 100 <= timeout_ms <= 60000:
             raise LogoutError('Invalid browser timeout')
+        dialogs = page.get_by_role('dialog').or_(page.get_by_role('alertdialog'))
+        existing_dialogs = [d.element_handle() for d in _visible(dialogs)]
         buttons = _visible(page.get_by_role('button', name=_pattern(labels)))
         if len(buttons) != 1:
             raise LogoutError('A unique global logout button was not found; account remains held')
         buttons[0].click(timeout=timeout_ms)
         # A direct logout may have no modal. If a modal appears, scope the confirm
         # search to it so a local logout elsewhere on the page can never be clicked.
-        dialogs = page.get_by_role('dialog').or_(page.get_by_role('alertdialog'))
         try:
-            dialogs.first.wait_for(state='visible', timeout=min(1500, timeout_ms))
+            page.wait_for_function('''previous => [...document.querySelectorAll('dialog,[role="dialog"],[role="alertdialog"]')]
+                .some(el => !previous.includes(el) && el.getClientRects().length &&
+                    getComputedStyle(el).visibility !== 'hidden')''', arg=existing_dialogs,
+                timeout=min(1500, timeout_ms))
         except Exception as exc:
             if type(exc).__name__ != 'TimeoutError':
                 raise
-        visible = _visible(dialogs)
+        # The screenshot's Settings window is itself a dialog. Only a newly
+        # opened confirmation may receive the second click.
+        visible = [d for d in _visible(dialogs)
+                   if d.evaluate('(el, previous) => !previous.includes(el)', existing_dialogs)]
         if len(visible) > 1:
             raise LogoutError('Multiple confirmation dialogs; account remains held')
         if visible:
