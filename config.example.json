@@ -1,0 +1,16 @@
+{
+  "database": "storage/claude_rental/rentals.sqlite3",
+  "claude_provider_file": "/absolute/path/to/validated_claude_provider.py",
+  "mailbox": {
+    "allowed_senders": [],
+    "poll_seconds": 5,
+    "timeout_seconds": 120
+  },
+  "rules": [
+    {
+      "pattern": "(?i)Claude PRO.*НА 5 ЧАСОВ.*АРЕНДА",
+      "hours": 5,
+      "quantity_is_duration": false
+    }
+  ]
+}
