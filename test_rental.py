@@ -134,6 +134,33 @@ class RentalTests(unittest.TestCase):
         with self.assertRaises(MailError):
             self.store.add('other@example.org', 'https://remail.aishop6.com/pickup?email=test%40example.org&token=fixture')
 
+    def test_manual_exclusion_survives_usage_refresh_and_restart(self):
+        self.store.set_disabled(1, True)
+        self.store.usage(1, 0, 0)
+        restarted = Store(self.store.path)
+        with self.assertRaises(Unavailable):
+            restarted.reserve('a', 'b', 'c', 18000)
+        self.assertEqual(restarted.admin_accounts()[0]['disabled'], 1)
+        restarted.set_disabled(1, False)
+        self.assertIsNotNone(restarted.reserve('a', 'b', 'c', 18000))
+        self.assertEqual(restarted.admin_accounts()[0]['order_id'], 'a')
+        self.assertNotIn('pickup', restarted.admin_accounts()[0])
+
+    def test_existing_database_migrates_without_losing_accounts(self):
+        import sqlite3
+        path = Path(self.tmp.name) / 'old.sqlite3'
+        with sqlite3.connect(path) as c:
+            c.execute('''CREATE TABLE accounts (id INTEGER PRIMARY KEY, email TEXT UNIQUE NOT NULL,
+                pickup TEXT NOT NULL, state TEXT NOT NULL DEFAULT 'quarantine',
+                five REAL,seven REAL,checked REAL)''')
+            c.execute('INSERT INTO accounts VALUES (1,?,?,?,?,?,?)',
+                      ('old@example.org', 'fixture', 'hold', 81, 10, 123))
+        for _ in range(2):
+            migrated = Store(path)
+            a = migrated.accounts()[0]
+            self.assertEqual((a['email'], a['state'], a['five'], a['disabled']),
+                             ('old@example.org', 'hold', 81, 0))
+
 
 if __name__ == '__main__':
     unittest.main()

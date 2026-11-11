@@ -1,3 +1,4 @@
+# noplug
 """Remail pickup API, using the contract supplied from /docs.
 
 No dependency on Cardinal. Tokens, messages and credentials are never logged.

@@ -1,6 +1,7 @@
 {
   "database": "storage/claude_rental/rentals.sqlite3",
-  "claude_provider_file": "/absolute/path/to/validated_claude_provider.py",
+  "claude_provider_file": "",
+  "enabled": false,
   "mailbox": {
     "allowed_senders": [],
     "poll_seconds": 5,

@@ -1,3 +1,4 @@
+# noplug
 """Durable exclusive rentals. Provider operations must be idempotent by order ID."""
 import argparse
 from contextlib import contextmanager
@@ -42,6 +43,8 @@ class Store:
                     order_id TEXT NOT NULL UNIQUE REFERENCES rentals(order_id),
                     PRIMARY KEY(account_id, message_id));
             ''')
+            if 'disabled' not in {r[1] for r in c.execute('PRAGMA table_info(accounts)')}:
+                c.execute('ALTER TABLE accounts ADD COLUMN disabled INTEGER NOT NULL DEFAULT 0')
 
     @contextmanager
     def db(self):
@@ -90,7 +93,7 @@ class Store:
                 if old['buyer'] != str(buyer) or old['chat'] != str(chat):
                     raise ValueError('Order owner mismatch')
                 return None  # Duplicate events never issue another login code.
-            a = c.execute('''SELECT * FROM accounts a WHERE state='ready'
+            a = c.execute('''SELECT * FROM accounts a WHERE state='ready' AND disabled=0
                 AND checked BETWEEN ? AND ? AND five<=70 AND seven<=70
                 AND NOT EXISTS (SELECT 1 FROM rentals r WHERE r.account_id=a.id AND r.state!='closed')
                 ORDER BY MAX(five,seven),id LIMIT 1''', (now - 120, now)).fetchone()
@@ -146,6 +149,23 @@ class Store:
     def accounts(self):
         with self.db() as c:
             return [dict(r) for r in c.execute('SELECT * FROM accounts')]
+
+    def set_disabled(self, account_id, disabled):
+        with self.db() as c:
+            result = c.execute('UPDATE accounts SET disabled=? WHERE id=?', (int(disabled), account_id))
+            if result.rowcount != 1:
+                raise ValueError('Account not found')
+
+    def admin_accounts(self):
+        with self.db() as c:
+            return [dict(r) for r in c.execute('''SELECT a.id,a.email,a.state,a.disabled,a.five,a.seven,
+                r.order_id,r.state AS rental_state,r.expires FROM accounts a LEFT JOIN rentals r
+                ON a.id=r.account_id AND r.state!='closed' ORDER BY a.id''')]
+
+    def recent_rentals(self):
+        with self.db() as c:
+            return [dict(r) for r in c.execute('''SELECT order_id,account_id,state,expires
+                FROM rentals ORDER BY rowid DESC LIMIT 20''')]
 
 
 class Engine:
