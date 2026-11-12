@@ -3,7 +3,6 @@ import os
 from pathlib import Path
 import subprocess
 import tempfile
-import threading
 import unittest
 from unittest.mock import patch
 
@@ -120,21 +119,10 @@ class BrowserUsageTests(unittest.TestCase):
                                   '<input type="email"><script>history.replaceState(null,"",'
                                   + json.dumps(target) + ')</script>')
                 self.context.route('**/*', route_request)
-                confirmation = unittest.mock.Mock()
+                progress = unittest.mock.Mock()
                 with self.assertRaisesRegex(CheckError, '^' + code + '$'):
-                    inspect_account(self.context, confirm_identity=confirmation)
-                confirmation.assert_not_called()
-
-    def test_browser_events_continue_while_console_waits_for_identity(self):
-        self.load(self.account(), ACCOUNT_URL)
-        event = threading.Event()
-        def routed_request(route):
-            route.fulfill(status=200, body='ok')
-            event.set()
-        self.context.route('**/event-check', routed_request)
-        self.page.evaluate("setTimeout(() => fetch('/event-check'), 50)")
-        answer = check.prompt_with_browser_events(self.page, 'fixture', reader=lambda _: 'yes' if event.wait(3) else 'no')
-        self.assertEqual(answer, 'yes')
+                    inspect_account(self.context, progress=progress)
+                progress.assert_called_once_with('reading_account')
 
     def test_connects_to_real_native_browser_on_a_random_local_port(self):
         original_popen = subprocess.Popen

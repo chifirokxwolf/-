@@ -7,14 +7,14 @@ from datetime import datetime, timezone
 import json
 import os
 from pathlib import Path
-import queue
 import re
 import sqlite3
 import subprocess
 import sys
 import tempfile
-import threading
 import time
+import traceback
+import uuid
 from urllib.parse import urlsplit
 
 if __package__:
@@ -27,6 +27,41 @@ from claude_browser_ui import (ACCOUNT_URL, USAGE_URL, LABELS, SettingsError, la
 
 class CheckError(Exception):
     pass
+
+
+TOOL_VERSION = '0.3.4'
+
+
+class CheckReport:
+    def __init__(self, path):
+        self.path = path
+        self.base = {'tool_version': TOOL_VERSION, 'run_id': uuid.uuid4().hex,
+                     'started_at': datetime.now(timezone.utc).isoformat()}
+        self.write('running', 'starting')
+
+    def write(self, result, stage, **data):
+        snapshot = {**self.base, 'checked_at': datetime.now(timezone.utc).isoformat(),
+                    'result': result, 'stage': stage, **data}
+        save_json(self.path, snapshot)
+
+
+def safe_error_details(exc):
+    # The raw exception may contain authentication URLs, selectors or account
+    # details. Export only fixed categories and our own function/line numbers.
+    message = str(exc).casefold()
+    tag = 'unclassified'
+    for fragment, value in (('has been closed', 'browser_or_page_closed'),
+                            ('connection closed', 'connection_closed'),
+                            ('event loop is closed', 'browser_driver_stopped'),
+                            ('strict mode violation', 'ambiguous_selector'),
+                            ('timeout', 'timeout')):
+        if fragment in message:
+            tag = value
+            break
+    frames = [{'function': frame.name, 'line': frame.lineno}
+              for frame in traceback.extract_tb(exc.__traceback__)
+              if Path(frame.filename).name in ('claude_account_check.py', 'claude_browser_ui.py')][-5:]
+    return {'error_type': type(exc).__name__, 'error_category': tag, 'error_frames': frames}
 
 
 def account_record(root, account_id):
@@ -69,19 +104,31 @@ def local_endpoint(profile):
     return 'ws://127.0.0.1:' + lines[0] + lines[1]
 
 
-def connect_profile(playwright, executable, profile):
+def connect_profile(playwright, executable, profile, diagnostics=None):
+    diagnostics = {} if diagnostics is None else diagnostics
     if not profile.is_dir():
         raise CheckError('manual_profile_missing')
-    subprocess.Popen([str(executable), '--user-data-dir=' + str(profile), '--no-first-run',
+    diagnostics.update(port_file_present=(profile / 'DevToolsActivePort').exists(), connected=False)
+    process = subprocess.Popen([str(executable), '--user-data-dir=' + str(profile), '--no-first-run',
                       '--remote-debugging-address=127.0.0.1', '--remote-debugging-port=0',
                       'about:blank'],
                      shell=False, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     deadline = time.monotonic() + 15
     while time.monotonic() < deadline:
         try:
-            return playwright.chromium.connect_over_cdp(local_endpoint(profile), timeout=1200)
-        except Exception:
+            diagnostics['endpoint_readable'] = False
+            endpoint = local_endpoint(profile)
+            diagnostics.update(port_file_present=True, endpoint_readable=True)
+            connection = playwright.chromium.connect_over_cdp(endpoint, timeout=1200)
+            diagnostics['connected'] = True
+            diagnostics.pop('last_error_type', None)
+            return connection
+        except Exception as exc:
+            diagnostics['last_error_type'] = type(exc).__name__
+            diagnostics['port_file_present'] = (profile / 'DevToolsActivePort').exists()
             time.sleep(0.4)
+    code = process.poll()
+    diagnostics['launcher_exit_code'] = code if type(code) is int else None
     raise CheckError('close_profile_windows_then_retry')
 
 
@@ -117,40 +164,17 @@ def visit_settings(page, url, labels):
     raise CheckError('settings_not_ready')
 
 
-def prompt_with_browser_events(page, prompt, reader=input):
-    # Blocking input() on the Playwright thread prevents Python-side browser
-    # callbacks from being serviced. Keep the event loop running during input.
-    results = queue.Queue(maxsize=1)
-    def read_answer():
-        try:
-            results.put((True, reader(prompt)))
-        except Exception:
-            results.put((False, None))
-    threading.Thread(target=read_answer, daemon=True).start()
-    while True:
-        try:
-            ok, answer = results.get_nowait()
-            if not ok:
-                raise CheckError('identity_not_confirmed')
-            return answer
-        except queue.Empty:
-            page.wait_for_timeout(100)
-
-
-def inspect_account(context, expected_organization=None, confirm_identity=None):
+def inspect_account(context, expected_organization=None, progress=None):
     page = context.new_page()
+    progress = progress or (lambda stage: None)
     try:
+        progress('reading_account')
         visit_settings(page, ACCOUNT_URL, LABELS['organization'])
         organization = read_organization(page)
         if expected_organization and organization != expected_organization:
             raise CheckError('account_identity_mismatch')
-        if confirm_identity:
-            if confirm_identity(page) is not True:
-                raise CheckError('identity_not_confirmed')
-            visit_settings(page, ACCOUNT_URL, LABELS['organization'])
-            if read_organization(page) != organization:
-                raise CheckError('account_changed_during_check')
         logout = global_logout_available(page)
+        progress('reading_usage')
         visit_settings(page, USAGE_URL, LABELS['session'])
         # A loading row is not a zero. Wait briefly for a complete, unambiguous view.
         deadline = time.monotonic() + 8
@@ -162,6 +186,7 @@ def inspect_account(context, expected_organization=None, confirm_identity=None):
                 if time.monotonic() >= deadline:
                     raise
                 page.wait_for_timeout(300)
+        progress('verifying_account')
         visit_settings(page, ACCOUNT_URL, LABELS['organization'])
         if read_organization(page) != organization:
             raise CheckError('account_changed_during_check')
@@ -199,10 +224,20 @@ def main():
         return 2
     root = ROOT
     account_id = None
+    stage = 'starting'
+    diagnostics = {}
+    try:
+        report_file = CheckReport(root / 'storage/claude_rental/browser_check.json')
+    except OSError:
+        print('Не удалось записать отчёт. Проверьте доступ к папке storage/claude_rental.')
+        return 2
+    print('Claude Browser Check ' + TOOL_VERSION)
     try:
         account_id = int(input('ID аккаунта из меню Cardinal: ').strip())
         if account_id < 1:
             raise ValueError()
+        stage = 'selecting_profile'
+        report_file.write('running', stage, account_id=account_id)
         account = account_record(root, account_id)
         browsers = installed_browsers()
         choices = list(browsers)
@@ -221,20 +256,30 @@ def main():
         print(f'Проверяется аккаунт #{account_id}: {account["email"]}')
         print('Окна этого тестового профиля нужно закрыть перед запуском проверки.')
         print('Подключение браузера будет доступно только на этом компьютере. После проверки закройте его окна.')
+        def progress(value):
+            nonlocal stage
+            stage = value
+            report_file.write('running', stage, account_id=account_id)
         with sync_playwright() as p:
-            connection = connect_profile(p, browsers[browser], profile)
+            progress('connecting_browser')
+            connection = connect_profile(p, browsers[browser], profile, diagnostics)
             if len(connection.contexts) != 1:
                 raise CheckError('ambiguous_browser_context')
-            def confirm_identity(page):
-                print('В открытом окне проверьте почту через меню аккаунта Claude.')
-                answer = prompt_with_browser_events(page, 'Почта совпадает с указанной выше? Введите ДА для привязки: ')
-                return answer.strip().casefold() in ('да', 'yes')
             organization, report = inspect_account(connection.contexts[0], binding.get('organization_id'),
-                                                    None if binding else confirm_identity)
+                                                   progress=progress)
+        # All Playwright work has ended before console input. No background
+        # stdin reader, nested browser waits or live automation during input.
+        print(f'Лимиты прочитаны: {report["five_hour"]:g}% за 5 часов; {report["seven_day"]:g}% за неделю.')
+        if not binding:
+            progress('awaiting_identity_confirmation')
+            print('Подтвердите: в выбранном профиле вы вручную вошли именно в указанную выше почту.')
+            answer = input('Введите ДА для привязки, либо Enter для отмены: ').strip().casefold()
+            if answer not in ('да', 'yes'):
+                raise CheckError('identity_not_confirmed')
+        progress('saving_result')
         bindings[str(account_id)] = {'browser': browser, 'organization_id': organization}
         save_json(binding_path, bindings)
-        report.update(result='ok', account_id=account_id, checked_at=datetime.now(timezone.utc).isoformat())
-        save_json(root / 'storage/claude_rental/browser_check.json', report)
+        report_file.write('ok', 'completed', account_id=account_id, connection=diagnostics, **report)
         print(f'Current session / за 5 часов: {report["five_hour"]:g}% использовано.')
         print(f'This week / за неделю: {report["seven_day"]:g}% использовано.')
         print('Кнопка глобального выхода: ' + ('найдена.' if report['global_logout_button'] else 'не найдена.'))
@@ -243,6 +288,7 @@ def main():
         print('Закройте окна тестового браузера, чтобы завершить локальное подключение.')
         return 0
     except (KeyboardInterrupt, EOFError):
+        report_file.write('cancelled', stage, account_id=account_id)
         print('\nПроверка отменена.')
         return 1
     except Exception as exc:
@@ -250,9 +296,9 @@ def main():
         print(ERRORS.get(code, 'Не удалось прочитать настройки. Проверьте вход, закройте диалог выхода и при необходимости завершите проверку сайта вручную.'))
         print('Код проверки: ' + code)
         # Never print Playwright exceptions, HTML, URLs or mailbox credentials.
-        report = {'result': 'error', 'code': code, 'account_id': account_id}
         try:
-            save_json(root / 'storage/claude_rental/browser_check.json', report)
+            report_file.write('error', stage, code=code, account_id=account_id,
+                              connection=diagnostics, **safe_error_details(exc))
         except OSError:
             pass
         return 1

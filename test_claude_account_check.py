@@ -1,4 +1,6 @@
 import json
+from contextlib import redirect_stdout
+import io
 from pathlib import Path
 import sqlite3
 import tempfile
@@ -9,6 +11,64 @@ from tools import claude_account_check as check
 
 
 class AccountCheckTests(unittest.TestCase):
+    def test_new_attempt_replaces_stale_error_before_waiting_for_input(self):
+        with tempfile.TemporaryDirectory() as folder:
+            path = Path(folder) / 'report.json'
+            check.save_json(path, {'result': 'error', 'code': 'old_failure'})
+            report = check.CheckReport(path)
+            first = json.loads(path.read_text())
+            self.assertEqual((first['result'], first['stage']), ('running', 'starting'))
+            self.assertNotIn('code', first)
+            report.write('running', 'awaiting_identity_confirmation', account_id=1)
+            waiting = json.loads(path.read_text())
+            self.assertEqual(waiting['run_id'], first['run_id'])
+            self.assertEqual(waiting['stage'], 'awaiting_identity_confirmation')
+            self.assertIn('checked_at', waiting)
+            report.write('cancelled', 'awaiting_identity_confirmation', account_id=1)
+            self.assertEqual(json.loads(path.read_text())['result'], 'cancelled')
+
+    def test_error_details_do_not_include_raw_messages_urls_or_email(self):
+        try:
+            raise RuntimeError('Connection closed https://claude.ai/login?token=PRIVATE test@example.org')
+        except RuntimeError as exc:
+            data = check.safe_error_details(exc)
+        self.assertEqual(data['error_category'], 'connection_closed')
+        serialized = json.dumps(data)
+        for secret in ('PRIVATE', 'example.org', 'https:', 'token='):
+            self.assertNotIn(secret, serialized)
+
+    def test_confirmation_is_on_main_thread_after_browser_session_finishes(self):
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder)
+            reads = []
+            with patch.object(check.sys, 'platform', 'win32'), patch.object(check, 'ROOT', root), \
+                    patch('playwright.sync_api.sync_playwright') as manager, \
+                    patch.object(check, 'account_record', return_value={'id': 1, 'email': 'fixture@example.org'}), \
+                    patch.object(check, 'installed_browsers', return_value={'edge': Path('msedge.exe')}), \
+                    patch.object(check, 'connect_profile') as connect, \
+                    patch.object(check, 'inspect_account', return_value=('fixture-org', {'five_hour': 12, 'seven_day': 34,
+                                 'global_logout_button': True, 'logout_tested': False, 'claude_code_revocation_tested': False})), \
+                    redirect_stdout(io.StringIO()):
+                connect.return_value.contexts = [Mock()]
+                def answer(prompt):
+                    import threading
+                    self.assertIs(threading.current_thread(), threading.main_thread())
+                    reads.append(prompt)
+                    state = json.loads((root / 'storage/claude_rental/browser_check.json').read_text())
+                    self.assertEqual(state['result'], 'running')
+                    if len(reads) < 3:
+                        manager.return_value.__enter__.assert_not_called()
+                        return '1'
+                    manager.return_value.__exit__.assert_called_once()
+                    self.assertEqual(state['stage'], 'awaiting_identity_confirmation')
+                    return 'ДА'
+                with patch('builtins.input', side_effect=answer):
+                    self.assertEqual(check.main(), 0)
+                result = json.loads((root / 'storage/claude_rental/browser_check.json').read_text())
+                self.assertEqual((result['result'], result['stage']), ('ok', 'completed'))
+                self.assertEqual(result['five_hour'], 12)
+                self.assertNotIn('fixture-org', json.dumps(result))
+
     def test_endpoint_only_accepts_local_browser_file_format(self):
         with tempfile.TemporaryDirectory() as folder:
             profile = Path(folder)
