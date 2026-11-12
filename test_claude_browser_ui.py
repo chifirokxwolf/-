@@ -6,7 +6,7 @@ import tempfile
 import unittest
 from unittest.mock import patch
 
-from claude_browser_ui import (ACCOUNT_URL, USAGE_URL, SettingsError, read_usage,
+from claude_browser_ui import (ACCOUNT_URL, USAGE_URL, LABELS, SettingsError, read_usage,
                                read_organization, global_logout_available)
 from tools import claude_account_check as check
 from tools.claude_account_check import CheckError, inspect_account
@@ -105,6 +105,62 @@ class BrowserUsageTests(unittest.TestCase):
         self.assertFalse(result['logout_tested'])
         with self.assertRaises(CheckError):
             inspect_account(self.context, '00000000-0000-0000-0000-000000000002')
+
+    def tab_navigation_fixture(self, labels=('Account', 'Usage')):
+        import json
+        # A settings app can read the fragment on startup, then use internal
+        # state for its tabs. Changing the fragment alone does not render it.
+        account = self.account().replace('<section role="dialog">', '<section>')
+        usage = self.usage('12%', '34%').replace('role="dialog"', '')
+        return '<body><section role="dialog"><nav>' + ''.join(
+            f'<button onclick="showTab(\'{section}\')">{label}</button>'
+            for section, label in zip(('account', 'usage'), labels)
+        ) + '</nav><article id="content"></article></section><script>const views=' + json.dumps(
+            {'account': account, 'usage': usage}
+        ) + ''';window.showTab = section => {
+            history.replaceState(null, '', '#settings/' + section);
+            document.querySelector('#content').innerHTML = views[section];
+        };showTab(location.hash.endsWith('/usage') ? 'usage' : 'account');</script>'''
+
+    def test_tab_navigation_when_hash_changes_do_not_update_settings(self):
+        self.html = self.tab_navigation_fixture()
+        # Establish that direct fragment navigation reproduces the failure.
+        self.page.goto(ACCOUNT_URL)
+        self.page.goto(USAGE_URL)
+        self.assertTrue(self.page.get_by_text('Organization ID', exact=True).is_visible())
+        self.assertEqual(self.page.get_by_text('Current session', exact=True).count(), 0)
+        for labels in (('Account', 'Usage'), ('Аккаунт', 'Использование')):
+            with self.subTest(labels=labels):
+                self.html = self.tab_navigation_fixture(labels)
+                navigation = []
+                org, report = inspect_account(self.context, ORG, navigation=navigation)
+                self.assertEqual(org, ORG)
+                self.assertEqual((report['five_hour'], report['seven_day']), (12, 34))
+                self.assertFalse(report['logout_tested'])
+                self.assertEqual([r['method'] for r in navigation], ['direct', 'settings_tab', 'settings_tab'])
+                self.assertEqual([r['target'] for r in navigation], ['account', 'usage', 'account'])
+                self.assertTrue(all(r['ready'] for r in navigation))
+                self.assertEqual(navigation[1]['visible_labels']['session'], 1)
+                import json
+                self.assertNotIn(ORG, json.dumps(navigation))
+                self.assertNotIn('https:', json.dumps(navigation))
+
+    def test_full_reload_fallback_when_settings_tabs_cannot_be_found(self):
+        self.html = self.tab_navigation_fixture(('Unknown account label', 'Unknown usage label'))
+        navigation = []
+        org, report = inspect_account(self.context, ORG, navigation=navigation)
+        self.assertEqual(org, ORG)
+        self.assertEqual(report['seven_day'], 34)
+        self.assertEqual([r['method'] for r in navigation], ['direct', 'full_reload', 'full_reload'])
+
+    def test_ambiguous_tab_or_additional_dialog_stops_without_clicking(self):
+        for extra in ('<button>Usage</button>',
+                      '<section role="alertdialog"><button>Log out of all devices</button></section>'):
+            self.load(self.tab_navigation_fixture().replace('</nav>', extra + '</nav>'), ACCOUNT_URL)
+            with self.assertRaisesRegex(SettingsError, '^ambiguous_settings_navigation$'):
+                check.visit_settings(self.page, USAGE_URL, LABELS['session'])
+            self.assertEqual(self.page.url, ACCOUNT_URL)
+            self.assertIsNone(self.page.locator('body').get_attribute('data-clicked'))
 
     def test_login_and_challenge_stop_before_identity_prompt(self):
         import json

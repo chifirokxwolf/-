@@ -22,14 +22,14 @@ if __package__:
 else:
     from claude_manual_login import ROOT, BROWSERS, installed_browsers, profile_path
 from claude_browser_ui import (ACCOUNT_URL, USAGE_URL, LABELS, SettingsError, label_pattern,
-                               read_organization, read_usage, global_logout_available)
+                               settings_tab, read_organization, read_usage, global_logout_available)
 
 
 class CheckError(Exception):
     pass
 
 
-TOOL_VERSION = '0.3.4'
+TOOL_VERSION = '0.3.5'
 
 
 class CheckReport:
@@ -144,9 +144,50 @@ def access_state(page):
     return None
 
 
-def visit_settings(page, url, labels):
+def visible_label_count(page, labels):
+    locator = page.get_by_text(label_pattern(labels))
+    return sum(locator.nth(i).is_visible() for i in range(locator.count()))
+
+
+def navigation_state(page, target):
+    # Fixed names and counts only: no page text, email, organization ID or URL.
+    return {'fragment_matches': urlsplit(page.url).fragment == 'settings/' + target,
+            'visible_labels': {kind: visible_label_count(page, labels)
+                               for kind, labels in LABELS.items()}}
+
+
+def visit_settings(page, url, labels, navigation=None):
+    destination = urlsplit(url)
+    section = destination.fragment.removeprefix('settings/')
+    record = {'target': section, 'method': 'direct', 'ready': False}
+    if navigation is not None:
+        navigation.append(record)
+    current = urlsplit(page.url)
+    same_document = (current.scheme, current.netloc, current.path, current.query) == (
+        destination.scheme, destination.netloc, destination.path, destination.query)
     try:
-        page.goto(url, wait_until='domcontentloaded', timeout=30000)
+        if same_document and current.fragment in ('settings/account', 'settings/usage'):
+            state = access_state(page)
+            if state:
+                raise CheckError(state)
+            record.update(navigation_state(page, section))
+            record['method'] = 'settings_tab'
+            tab = settings_tab(page, section)
+            if tab is not None:
+                tab.click(timeout=5000)
+            else:
+                # A fragment-only goto need not update a React tab. If no
+                # unique sidebar label is available, load the target afresh.
+                record['method'] = 'full_reload'
+                page.goto(url, wait_until='domcontentloaded', timeout=30000)
+                state = access_state(page)
+                if state:
+                    raise CheckError(state)
+                page.reload(wait_until='domcontentloaded', timeout=30000)
+        else:
+            page.goto(url, wait_until='domcontentloaded', timeout=30000)
+    except (CheckError, SettingsError):
+        raise
     except Exception:
         state = access_state(page)
         if state in ('site_security_check', 'sign_in_manually_first'):
@@ -157,25 +198,26 @@ def visit_settings(page, url, labels):
         state = access_state(page)
         if state:
             raise CheckError(state)
-        locator = page.get_by_text(label_pattern(labels))
-        if any(locator.nth(i).is_visible() for i in range(locator.count())):
+        record.update(navigation_state(page, section))
+        if record['fragment_matches'] and visible_label_count(page, labels) == 1:
+            record['ready'] = True
             return
         page.wait_for_timeout(200)
     raise CheckError('settings_not_ready')
 
 
-def inspect_account(context, expected_organization=None, progress=None):
+def inspect_account(context, expected_organization=None, progress=None, navigation=None):
     page = context.new_page()
     progress = progress or (lambda stage: None)
     try:
         progress('reading_account')
-        visit_settings(page, ACCOUNT_URL, LABELS['organization'])
+        visit_settings(page, ACCOUNT_URL, LABELS['organization'], navigation)
         organization = read_organization(page)
         if expected_organization and organization != expected_organization:
             raise CheckError('account_identity_mismatch')
         logout = global_logout_available(page)
         progress('reading_usage')
-        visit_settings(page, USAGE_URL, LABELS['session'])
+        visit_settings(page, USAGE_URL, LABELS['session'], navigation)
         # A loading row is not a zero. Wait briefly for a complete, unambiguous view.
         deadline = time.monotonic() + 8
         while True:
@@ -187,7 +229,7 @@ def inspect_account(context, expected_organization=None, progress=None):
                     raise
                 page.wait_for_timeout(300)
         progress('verifying_account')
-        visit_settings(page, ACCOUNT_URL, LABELS['organization'])
+        visit_settings(page, ACCOUNT_URL, LABELS['organization'], navigation)
         if read_organization(page) != organization:
             raise CheckError('account_changed_during_check')
         return organization, {**usage, 'global_logout_button': logout,
@@ -210,6 +252,7 @@ ERRORS = {
     'sign_in_manually_first': 'В этом профиле нет выполненного входа. Закройте проверку и окна тестового браузера, войдите через open_claude_manual.cmd с тем же ID и браузером, затем повторите проверку.',
     'site_security_check': 'Сайт запросил проверку безопасности. Программная проверка остановлена. Закройте её и выполните проверку вручную через open_claude_manual.cmd. Повторные попытки автоматически не запускаются.',
     'settings_not_ready': 'Страница настроек не готова или её разметка изменилась. Сохраните код ошибки; нулевые лимиты не подставляются.',
+    'ambiguous_settings_navigation': 'Открыто несколько диалогов или найдено несколько одинаковых пунктов настроек. Закройте дополнительные диалоги и повторите проверку.',
 }
 
 
@@ -226,6 +269,7 @@ def main():
     account_id = None
     stage = 'starting'
     diagnostics = {}
+    navigation = []
     try:
         report_file = CheckReport(root / 'storage/claude_rental/browser_check.json')
     except OSError:
@@ -259,14 +303,14 @@ def main():
         def progress(value):
             nonlocal stage
             stage = value
-            report_file.write('running', stage, account_id=account_id)
+            report_file.write('running', stage, account_id=account_id, connection=diagnostics, navigation=navigation)
         with sync_playwright() as p:
             progress('connecting_browser')
             connection = connect_profile(p, browsers[browser], profile, diagnostics)
             if len(connection.contexts) != 1:
                 raise CheckError('ambiguous_browser_context')
             organization, report = inspect_account(connection.contexts[0], binding.get('organization_id'),
-                                                   progress=progress)
+                                                   progress=progress, navigation=navigation)
         # All Playwright work has ended before console input. No background
         # stdin reader, nested browser waits or live automation during input.
         print(f'Лимиты прочитаны: {report["five_hour"]:g}% за 5 часов; {report["seven_day"]:g}% за неделю.')
@@ -279,7 +323,8 @@ def main():
         progress('saving_result')
         bindings[str(account_id)] = {'browser': browser, 'organization_id': organization}
         save_json(binding_path, bindings)
-        report_file.write('ok', 'completed', account_id=account_id, connection=diagnostics, **report)
+        report_file.write('ok', 'completed', account_id=account_id, connection=diagnostics,
+                          navigation=navigation, **report)
         print(f'Current session / за 5 часов: {report["five_hour"]:g}% использовано.')
         print(f'This week / за неделю: {report["seven_day"]:g}% использовано.')
         print('Кнопка глобального выхода: ' + ('найдена.' if report['global_logout_button'] else 'не найдена.'))
@@ -298,7 +343,7 @@ def main():
         # Never print Playwright exceptions, HTML, URLs or mailbox credentials.
         try:
             report_file.write('error', stage, code=code, account_id=account_id,
-                              connection=diagnostics, **safe_error_details(exc))
+                              connection=diagnostics, navigation=navigation, **safe_error_details(exc))
         except OSError:
             pass
         return 1

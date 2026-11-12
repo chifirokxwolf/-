@@ -12,6 +12,12 @@ from claude_browser_actions import GLOBAL_LABELS
 
 ACCOUNT_URL = 'https://claude.ai/new#settings/account'
 USAGE_URL = 'https://claude.ai/new#settings/usage'
+NAV_LABELS = {
+    'account': ('Account', 'Аккаунт', 'Учётная запись', 'Учетная запись', 'Обліковий запис',
+                'Konto', 'Compte', 'Cuenta', 'Conta', '账户', '帳戶', 'アカウント', '계정'),
+    'usage': ('Usage', 'Использование', 'Использование ресурсов', 'Використання',
+              'Nutzung', 'Utilisation', 'Uso', '使用情况', '使用量', '用量', '사용량'),
+}
 LABELS = {
     'session': ('Current session', 'Текущий сеанс', 'Текущая сессия', 'Поточний сеанс',
                 'Aktuelle Sitzung', 'Session actuelle', 'Sesión actual', 'Sessão atual',
@@ -42,6 +48,24 @@ def require_page(page, section):
 
 def label_pattern(labels):
     return re.compile(r'^\s*(?:' + '|'.join(re.escape(x) for x in labels) + r')\s*$', re.I)
+
+
+def settings_tab(page, section):
+    """Find one exact settings navigation label; never guess among dialogs."""
+    current = urlsplit(page.url).fragment.removeprefix('settings/')
+    if current not in NAV_LABELS or section not in NAV_LABELS:
+        raise SettingsError('wrong_settings_page')
+    require_page(page, current)
+    dialogs = page.locator('dialog, [role="dialog"], [role="alertdialog"]')
+    visible = [dialogs.nth(i) for i in range(dialogs.count()) if dialogs.nth(i).is_visible()]
+    if len(visible) > 1:
+        raise SettingsError('ambiguous_settings_navigation')
+    scope = visible[0] if visible else page.locator('body')
+    candidates = scope.get_by_text(label_pattern(NAV_LABELS[section]))
+    tabs = [candidates.nth(i) for i in range(candidates.count()) if candidates.nth(i).is_visible()]
+    if len(tabs) > 1:
+        raise SettingsError('ambiguous_settings_navigation')
+    return tabs[0] if tabs else None
 
 
 def unique_label(page, labels):
