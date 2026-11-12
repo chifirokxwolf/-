@@ -44,5 +44,6 @@
       "quantity_is_duration": true,
       "check_paid_term": true
     }
-  ]
+  ],
+  "auto_kick": true
 }

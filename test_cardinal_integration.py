@@ -340,7 +340,7 @@ class CardinalIntegrationTests(unittest.TestCase):
 
     def test_native_start_stop_and_delete_hooks(self):
         self.c.run_handlers(self.c.handler_bind_var_names['BIND_TO_POST_START'], (self.c,))
-        self.assertEqual(len(self.runtime.threads), 3)
+        self.assertEqual(len(self.runtime.threads), 4)
         self.c.run_handlers(self.c.handler_bind_var_names['BIND_TO_PRE_STOP'], (self.c,))
         self.assertTrue(self.runtime.stop.is_set())
         self.plugin.BIND_TO_DELETE(self.c, None)

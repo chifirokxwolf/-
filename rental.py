@@ -57,6 +57,11 @@ class Store:
                     order_id TEXT PRIMARY KEY, buyer TEXT NOT NULL, chat TEXT NOT NULL,
                     seconds INTEGER NOT NULL, kind TEXT NOT NULL DEFAULT 'pending',
                     rental_id TEXT REFERENCES rentals(order_id), created REAL NOT NULL);
+                CREATE TABLE IF NOT EXISTS auto_kicks (
+                    order_id TEXT PRIMARY KEY REFERENCES rentals(order_id),
+                    state TEXT NOT NULL, attempts INTEGER NOT NULL DEFAULT 0,
+                    next_attempt REAL NOT NULL DEFAULT 0, error TEXT NOT NULL DEFAULT '',
+                    verified_at REAL);
                 CREATE TABLE IF NOT EXISTS buyers (
                     buyer TEXT PRIMARY KEY, first_order_id TEXT NOT NULL UNIQUE,
                     bonus_state TEXT NOT NULL DEFAULT 'pending');
@@ -246,6 +251,34 @@ class Store:
             return [dict(r) for r in c.execute('''SELECT r.*,a.email,a.pickup FROM rentals r
                 JOIN accounts a ON a.id=r.account_id WHERE r.state='cleanup' ''')]
 
+    def claim_kick(self, order_id, now=None):
+        now = time.time() if now is None else now
+        with self.db() as c:
+            row = c.execute("SELECT account_id FROM rentals WHERE order_id=? AND state='cleanup' AND expires<=?",
+                            (order_id, now)).fetchone()
+            if row is None:
+                return False
+            c.execute("INSERT OR IGNORE INTO auto_kicks(order_id,state) VALUES (?,'pending')", (order_id,))
+            updated = c.execute("""UPDATE auto_kicks SET state='working',attempts=attempts+1,
+                next_attempt=?,error='' WHERE order_id=? AND state!='browser_revoked' AND next_attempt<=?""",
+                (now + 60, order_id, now))
+            if updated.rowcount != 1:
+                return False
+            c.execute("UPDATE accounts SET state='hold',checked=NULL WHERE id=?", (row[0],))
+            return True
+
+    def finish_kick(self, order_id, error='', now=None):
+        now = time.time() if now is None else now
+        with self.db() as c:
+            row = c.execute("SELECT attempts FROM auto_kicks WHERE order_id=? AND state='working'", (order_id,)).fetchone()
+            if row is None:
+                raise Unavailable('No running cleanup')
+            delay = min(300, 30 * 2 ** min(row[0], 4))
+            c.execute("""UPDATE auto_kicks SET state=?,error=?,next_attempt=?,verified_at=?
+                WHERE order_id=?""", ('retry' if error else 'browser_revoked', error,
+                                       now + delay if error else 0, None if error else now, order_id))
+            # Keep exclusive reservation: browser evidence does not cover Code or login links.
+
     def close(self, order_id):
         with self.db() as c:
             r = c.execute('SELECT account_id FROM rentals WHERE order_id=?', (order_id,)).fetchone()
@@ -270,8 +303,9 @@ class Store:
 
     def recent_rentals(self):
         with self.db() as c:
-            return [dict(r) for r in c.execute('''SELECT order_id,account_id,state,expires,seconds
-                FROM rentals ORDER BY rowid DESC LIMIT 20''')]
+            return [dict(r) for r in c.execute('''SELECT r.order_id,r.account_id,r.state,r.expires,r.seconds,
+                k.state AS kick_state,k.error AS kick_error,k.attempts AS kick_attempts
+                FROM rentals r LEFT JOIN auto_kicks k ON k.order_id=r.order_id ORDER BY r.rowid DESC LIMIT 20''')]
 
 
 class Engine:

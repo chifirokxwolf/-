@@ -18,8 +18,8 @@ from types import ModuleType
 from email.utils import parseaddr
 
 NAME = 'Claude Rental'
-VERSION = '0.3.6'
-DESCRIPTION = 'Аренда Claude: аккаунты, почта Remail и управление выдачей. Требуется Claude-адаптер.'
+VERSION = '0.4.0'
+DESCRIPTION = 'Аренда Claude: браузерный авто-кик по сроку, аккаунты и Remail. Для выдачи нужен адаптер.'
 CREDITS = 'Local development'
 UUID = '52280b60-3fd9-4df7-9eb3-f1bb1cd337ef'
 SETTINGS_PAGE = True
@@ -43,6 +43,7 @@ DEFAULT_CONFIG = {
     'database': 'storage/claude_rental/rentals.sqlite3',
     'claude_provider_file': '',
     'enabled': False,
+    'auto_kick': True,
     'rules_schema': 1,
     'mailbox': {'allowed_senders': [], 'poll_seconds': 5, 'timeout_seconds': 120},
     'rules': rules_module.default_rules(),
@@ -60,16 +61,23 @@ def load_file(name, path):
 def components():
     # Release embeds Python sources, never credentials or databases.
     sources = globals().get('_EMBEDDED_SOURCES')
+    names = ('remail', 'rental', 'claude_browser_actions', 'claude_browser_ui',
+             'claude_manual_login', 'claude_account_check', 'claude_auto_kick')
     if sources is None:
-        sources = {name: Path(__file__).with_name(name + '.py').read_text(encoding='utf-8')
-                   for name in ('remail', 'rental', 'claude_browser_actions')}
+        root = Path(__file__).parent
+        sources = {name: (root / ('tools' if name in ('claude_manual_login', 'claude_account_check') else '')
+                         / (name + '.py')).read_text(encoding='utf-8') for name in names}
     modules = {}
-    for name in ('remail', 'rental', 'claude_browser_actions'):
-        module_name = '_claude_rental_browser_actions' if name == 'claude_browser_actions' else '_claude_rental_' + name
-        module = ModuleType(module_name)
-        sys.modules[module_name] = module
-        source = sources[name].replace('from remail import credentials, login_value',
-                                      'from _claude_rental_remail import credentials, login_value')
+    aliases = {name: '_claude_rental_' + name for name in names}
+    aliases['claude_browser_actions'] = '_claude_rental_browser_actions'
+    for name in names:
+        module = ModuleType(aliases[name])
+        module.__file__ = str(Path.cwd() / 'tools' / (name + '.py'))
+        sys.modules[module.__name__] = module
+        source = sources[name]
+        for dep in names:
+            for prefix in ('tools.', '.', ''):
+                source = source.replace('from ' + prefix + dep + ' import ', 'from ' + aliases[dep] + ' import ')
         exec(compile(source, f'<claude_rental/{name}.py>', 'exec'), module.__dict__)
         modules[name] = module
     return modules['rental'], modules['remail']
@@ -112,6 +120,8 @@ class Runtime:
         self.review_cursor = 0
         self.threads = []
         self.connect_provider()
+        kick_module = sys.modules['_claude_rental_claude_auto_kick']
+        self.auto_kick = kick_module.AutoKick(self.store, kick_module.BrowserKicker(Path.cwd()))
 
     def save_config(self):
         self.path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
@@ -211,6 +221,12 @@ class Runtime:
             with self.lock:
                 self.queued.discard(task[0])
 
+    def kick_once(self, stop_event=None):
+        # A custom full provider retains ownership of cleanup. The built-in worker
+        # can run without the sales/mail adapter, including while new sales pause.
+        if self.available() and self.config.get('auto_kick', True) and self.engine is None:
+            self.auto_kick.tick(self.stop if stop_event is None else stop_event)
+
     def start(self):
         if not self.stop.is_set() and any(t.is_alive() for t in self.threads):
             return
@@ -252,6 +268,15 @@ class Runtime:
                         log.error('Claude Rental: maintenance failed')
                 run_stop.wait(30)
 
+        def kick_worker():
+            while not run_stop.is_set():
+                try:
+                    self.kick_once(run_stop)
+                except Exception:
+                    self.last_error = 'Ошибка авто-кика; аккаунт остаётся занят. Проверьте базу и профиль браузера.'
+                    log.error('Claude Rental: auto-kick failed')
+                run_stop.wait(5)
+
         def review_worker():
             while not run_stop.is_set():
                 try:
@@ -271,7 +296,7 @@ class Runtime:
                     self.reviews.task_done()
 
         self.threads = [threading.Thread(target=f, daemon=True, name='claude-rental-' + label)
-                        for f, label in ((delivery_worker, 'orders'), (maintenance_worker, 'maintenance'), (review_worker, 'reviews'))]
+                        for f, label in ((delivery_worker, 'orders'), (maintenance_worker, 'maintenance'), (review_worker, 'reviews'), (kick_worker, 'auto-kick'))]
         for thread in self.threads:
             thread.start()
 
@@ -303,6 +328,10 @@ def register_panel(runtime):
         text = (f'<b>Claude Rental {VERSION}</b>\nНовые выдачи: {state}.\n'
                 f'{escape(runtime.status)}\nАккаунтов: {len(runtime.store.accounts())}'
                 '\nБонус: один раз за первую покупку. Напоминание: за 15 минут.')
+        text += '\nАвто-кик: ' + ('через внешний адаптер' if runtime.engine else
+                                    ('включён' if runtime.config.get('auto_kick', True) else 'выключен'))
+        if runtime.auto_kick.last_error:
+            text += '\nАвто-кик требует проверки: ' + escape(runtime.auto_kick.last_error)
         if runtime.last_error:
             text += '\n' + escape(runtime.last_error)
         keyboard = InlineKeyboardMarkup(row_width=2)
@@ -429,7 +458,10 @@ def register_panel(runtime):
             elif action == 'rentals':
                 rows = runtime.store.recent_rentals()
                 text = '\n'.join(f"{escape(r['order_id'])}: аккаунт #{r['account_id']}, {escape(r['state'])}, "
-                                 f"окончание {runtime.core.end_time(r['expires'])}" for r in rows)
+                                 f"окончание {runtime.core.end_time(r['expires'])}"
+                                 + (f"; авто-кик: {escape(r['kick_state'])}"
+                                    + (f" ({escape(r['kick_error'])})" if r['kick_error'] else '')
+                                    if r['kick_state'] else '') for r in rows)
                 say(chat_id, text or 'Аренд пока нет.')
         except Exception:
             say(chat_id, 'Операция не выполнена. Проверьте данные или доступ к Remail; секреты не выводятся.')

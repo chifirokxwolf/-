@@ -29,7 +29,7 @@ class CheckError(Exception):
     pass
 
 
-TOOL_VERSION = '0.3.6'
+TOOL_VERSION = '0.4.0'
 
 
 class CheckReport:
@@ -330,14 +330,14 @@ def main():
         # All Playwright work has ended before console input. No background
         # stdin reader, nested browser waits or live automation during input.
         print(f'Лимиты прочитаны: {report["five_hour"]:g}% за 5 часов; {report["seven_day"]:g}% за неделю.')
-        if not binding:
+        if not binding or binding.get('email', '').casefold() != account['email'].casefold():
             progress('awaiting_identity_confirmation')
             print('Подтвердите: в выбранном профиле вы вручную вошли именно в указанную выше почту.')
             answer = input('Введите ДА для привязки, либо Enter для отмены: ').strip().casefold()
             if answer not in ('да', 'yes'):
                 raise CheckError('identity_not_confirmed')
         progress('saving_result')
-        bindings[str(account_id)] = {'browser': browser, 'organization_id': organization}
+        bindings[str(account_id)] = {'browser': browser, 'organization_id': organization, 'email': account['email']}
         save_json(binding_path, bindings)
         report_file.write('ok', 'completed', account_id=account_id, connection=diagnostics,
                           navigation=navigation, usage_reading=usage_diagnostics, **report)
