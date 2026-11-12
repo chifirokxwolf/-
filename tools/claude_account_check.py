@@ -7,12 +7,15 @@ from datetime import datetime, timezone
 import json
 import os
 from pathlib import Path
+import queue
 import re
 import sqlite3
 import subprocess
 import sys
 import tempfile
+import threading
 import time
+from urllib.parse import urlsplit
 
 if __package__:
     from .claude_manual_login import ROOT, BROWSERS, installed_browsers, profile_path
@@ -71,7 +74,7 @@ def connect_profile(playwright, executable, profile):
         raise CheckError('manual_profile_missing')
     subprocess.Popen([str(executable), '--user-data-dir=' + str(profile), '--no-first-run',
                       '--remote-debugging-address=127.0.0.1', '--remote-debugging-port=0',
-                      '--new-window', 'https://claude.ai/'],
+                      'about:blank'],
                      shell=False, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     deadline = time.monotonic() + 15
     while time.monotonic() < deadline:
@@ -82,17 +85,73 @@ def connect_profile(playwright, executable, profile):
     raise CheckError('close_profile_windows_then_retry')
 
 
-def inspect_account(context, expected_organization=None):
+def access_state(page):
+    u = urlsplit(page.url)
+    if u.scheme != 'https' or u.hostname != 'claude.ai':
+        return 'wrong_settings_origin'
+    if (u.path.startswith(('/api/challenge_redirect', '/cdn-cgi/'))
+            or re.fullmatch(r'\s*(Just a moment|Один момент)[.!…\s]*', page.title(), re.I)):
+        return 'site_security_check'
+    if u.path.rstrip('/') in ('/login', '/signup'):
+        return 'sign_in_manually_first'
+    return None
+
+
+def visit_settings(page, url, labels):
+    try:
+        page.goto(url, wait_until='domcontentloaded', timeout=30000)
+    except Exception:
+        state = access_state(page)
+        if state in ('site_security_check', 'sign_in_manually_first'):
+            raise CheckError(state) from None
+        raise CheckError('settings_navigation_failed') from None
+    deadline = time.monotonic() + 10
+    while time.monotonic() < deadline:
+        state = access_state(page)
+        if state:
+            raise CheckError(state)
+        locator = page.get_by_text(label_pattern(labels))
+        if any(locator.nth(i).is_visible() for i in range(locator.count())):
+            return
+        page.wait_for_timeout(200)
+    raise CheckError('settings_not_ready')
+
+
+def prompt_with_browser_events(page, prompt, reader=input):
+    # Blocking input() on the Playwright thread prevents Python-side browser
+    # callbacks from being serviced. Keep the event loop running during input.
+    results = queue.Queue(maxsize=1)
+    def read_answer():
+        try:
+            results.put((True, reader(prompt)))
+        except Exception:
+            results.put((False, None))
+    threading.Thread(target=read_answer, daemon=True).start()
+    while True:
+        try:
+            ok, answer = results.get_nowait()
+            if not ok:
+                raise CheckError('identity_not_confirmed')
+            return answer
+        except queue.Empty:
+            page.wait_for_timeout(100)
+
+
+def inspect_account(context, expected_organization=None, confirm_identity=None):
     page = context.new_page()
     try:
-        page.goto(ACCOUNT_URL, wait_until='domcontentloaded', timeout=30000)
-        page.get_by_text(label_pattern(LABELS['organization'])).first.wait_for(state='visible', timeout=10000)
+        visit_settings(page, ACCOUNT_URL, LABELS['organization'])
         organization = read_organization(page)
         if expected_organization and organization != expected_organization:
             raise CheckError('account_identity_mismatch')
+        if confirm_identity:
+            if confirm_identity(page) is not True:
+                raise CheckError('identity_not_confirmed')
+            visit_settings(page, ACCOUNT_URL, LABELS['organization'])
+            if read_organization(page) != organization:
+                raise CheckError('account_changed_during_check')
         logout = global_logout_available(page)
-        page.goto(USAGE_URL, wait_until='domcontentloaded', timeout=30000)
-        page.get_by_text(label_pattern(LABELS['session'])).first.wait_for(state='visible', timeout=10000)
+        visit_settings(page, USAGE_URL, LABELS['session'])
         # A loading row is not a zero. Wait briefly for a complete, unambiguous view.
         deadline = time.monotonic() + 8
         while True:
@@ -103,8 +162,7 @@ def inspect_account(context, expected_organization=None):
                 if time.monotonic() >= deadline:
                     raise
                 page.wait_for_timeout(300)
-        page.goto(ACCOUNT_URL, wait_until='domcontentloaded', timeout=30000)
-        page.get_by_text(label_pattern(LABELS['organization'])).first.wait_for(state='visible', timeout=10000)
+        visit_settings(page, ACCOUNT_URL, LABELS['organization'])
         if read_organization(page) != organization:
             raise CheckError('account_changed_during_check')
         return organization, {**usage, 'global_logout_button': logout,
@@ -124,6 +182,9 @@ ERRORS = {
     'close_profile_windows_then_retry': 'Подключение не открылось. Закройте все окна тестового профиля и повторите запуск. Политика браузера также может запрещать подключение.',
     'account_identity_mismatch': 'Профиль принадлежит другой организации Claude. Проверка остановлена.',
     'account_changed_during_check': 'Аккаунт изменился во время проверки. Результат отклонён.',
+    'sign_in_manually_first': 'В этом профиле нет выполненного входа. Закройте проверку и окна тестового браузера, войдите через open_claude_manual.cmd с тем же ID и браузером, затем повторите проверку.',
+    'site_security_check': 'Сайт запросил проверку безопасности. Программная проверка остановлена. Закройте её и выполните проверку вручную через open_claude_manual.cmd. Повторные попытки автоматически не запускаются.',
+    'settings_not_ready': 'Страница настроек не готова или её разметка изменилась. Сохраните код ошибки; нулевые лимиты не подставляются.',
 }
 
 
@@ -164,12 +225,12 @@ def main():
             connection = connect_profile(p, browsers[browser], profile)
             if len(connection.contexts) != 1:
                 raise CheckError('ambiguous_browser_context')
-            if not binding:
+            def confirm_identity(page):
                 print('В открытом окне проверьте почту через меню аккаунта Claude.')
-                answer = input('Почта совпадает с указанной выше? Введите ДА для привязки: ').strip().casefold()
-                if answer not in ('да', 'yes'):
-                    raise CheckError('identity_not_confirmed')
-            organization, report = inspect_account(connection.contexts[0], binding.get('organization_id'))
+                answer = prompt_with_browser_events(page, 'Почта совпадает с указанной выше? Введите ДА для привязки: ')
+                return answer.strip().casefold() in ('да', 'yes')
+            organization, report = inspect_account(connection.contexts[0], binding.get('organization_id'),
+                                                    None if binding else confirm_identity)
         bindings[str(account_id)] = {'browser': browser, 'organization_id': organization}
         save_json(binding_path, bindings)
         report.update(result='ok', account_id=account_id, checked_at=datetime.now(timezone.utc).isoformat())

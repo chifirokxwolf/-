@@ -3,7 +3,7 @@
 **При бесконечной проверке Cloudflare в Chromium используйте
 [новый ручной запуск Chrome/Edge](CLAUDE_MANUAL_LOGIN_RU.md).** Установленный
 браузер открывается без Playwright, с отдельным профилем. Архив для этого шага:
-[`claude-windows-login-0.3.1.zip`](https://github.com/chifirokxwolf/-/raw/refs/heads/main/dist/claude-windows-login-0.3.1.zip).
+[`claude-windows-login-0.3.3.zip`](https://github.com/chifirokxwolf/-/raw/refs/heads/main/dist/claude-windows-login-0.3.3.zip).
 Ниже сохранены инструкции к первоначальному инструменту 0.3.0.
 
 Для подключения нужны работающий Cardinal на Windows, Python из его установки,

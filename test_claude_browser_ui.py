@@ -3,6 +3,7 @@ import os
 from pathlib import Path
 import subprocess
 import tempfile
+import threading
 import unittest
 from unittest.mock import patch
 
@@ -106,6 +107,35 @@ class BrowserUsageTests(unittest.TestCase):
         with self.assertRaises(CheckError):
             inspect_account(self.context, '00000000-0000-0000-0000-000000000002')
 
+    def test_login_and_challenge_stop_before_identity_prompt(self):
+        import json
+        for target, code in [('https://claude.ai/login', 'sign_in_manually_first'),
+                             ('https://claude.ai/api/challenge_redirect?to=login', 'site_security_check')]:
+            with self.subTest(target=target):
+                self.context.unroute('**/*')
+                def route_request(route):
+                    # Model the SPA's auth navigation without any live request
+                    # to the real login/challenge service.
+                    route.fulfill(status=200, content_type='text/html', body='<title>Login</title>'
+                                  '<input type="email"><script>history.replaceState(null,"",'
+                                  + json.dumps(target) + ')</script>')
+                self.context.route('**/*', route_request)
+                confirmation = unittest.mock.Mock()
+                with self.assertRaisesRegex(CheckError, '^' + code + '$'):
+                    inspect_account(self.context, confirm_identity=confirmation)
+                confirmation.assert_not_called()
+
+    def test_browser_events_continue_while_console_waits_for_identity(self):
+        self.load(self.account(), ACCOUNT_URL)
+        event = threading.Event()
+        def routed_request(route):
+            route.fulfill(status=200, body='ok')
+            event.set()
+        self.context.route('**/event-check', routed_request)
+        self.page.evaluate("setTimeout(() => fetch('/event-check'), 50)")
+        answer = check.prompt_with_browser_events(self.page, 'fixture', reader=lambda _: 'yes' if event.wait(3) else 'no')
+        self.assertEqual(answer, 'yes')
+
     def test_connects_to_real_native_browser_on_a_random_local_port(self):
         original_popen = subprocess.Popen
         children = []
@@ -121,6 +151,8 @@ class BrowserUsageTests(unittest.TestCase):
                 with patch.object(check.subprocess, 'Popen', side_effect=launch):
                     connection = check.connect_profile(self.p, os.environ.get('CHROMIUM_PATH', '/usr/bin/chromium'), Path(folder))
                 self.assertEqual(len(connection.contexts), 1)
+                from tools.claude_manual_login import profile_in_check_mode
+                self.assertTrue(profile_in_check_mode(Path(folder)))
                 context = connection.contexts[0]
                 context.route('**/*', lambda route: route.fulfill(status=200, content_type='text/html', body=self.usage('12%', '34%')))
                 page = context.new_page()

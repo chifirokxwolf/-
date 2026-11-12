@@ -11,6 +11,23 @@ from tools import claude_manual_login as manual
 
 
 class ManualLoginTests(unittest.TestCase):
+    def test_manual_launch_rejects_a_live_check_process_without_killing_it(self):
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder)
+            profile = manual.profile_path(1, 'edge', root)
+            profile.mkdir(parents=True)
+            (profile / 'DevToolsActivePort').write_text('9222\n/devtools/browser/fixture-id')
+            with patch.object(manual.http.client, 'HTTPConnection') as http, patch.object(manual.subprocess, 'Popen') as launch:
+                response = http.return_value.getresponse.return_value
+                response.status = 200
+                response.read.return_value = b'{"webSocketDebuggerUrl":"ws://127.0.0.1:9222/devtools/browser/fixture-id"}'
+                with self.assertRaises(manual.ProfileInCheckMode):
+                    manual.launch_browser(Path('msedge.exe'), 1, 'edge', root)
+                launch.assert_not_called()
+                http.return_value.close.assert_called_once()
+                response.read.return_value = b'{"webSocketDebuggerUrl":"ws://127.0.0.1:9222/devtools/browser/another-profile"}'
+                self.assertFalse(manual.profile_in_check_mode(profile))
+
     def test_detects_user_chrome_and_system_edge_without_using_path(self):
         with tempfile.TemporaryDirectory(prefix='manual profile ') as folder:
             root = Path(folder)

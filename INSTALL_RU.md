@@ -1,6 +1,6 @@
 # Установка Claude Rental
 
-Актуальная версия **0.3.2** устанавливается как один плагин через Telegram-бота Cardinal.
+Актуальная версия **0.3.3** устанавливается как один плагин через Telegram-бота Cardinal.
 
 1. Скачайте файл [`dist/claude_rental_plugin.py`](dist/claude_rental_plugin.py).
 2. Отправьте своему боту Cardinal команду `/upload_plugin`, затем файл как документ.

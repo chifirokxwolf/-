@@ -32,6 +32,8 @@ class AccountCheckTests(unittest.TestCase):
             self.assertIn('--remote-debugging-address=127.0.0.1', args)
             self.assertIn('--remote-debugging-port=0', args)
             self.assertIn('--user-data-dir=' + str(profile), args)
+            self.assertNotIn('--new-window', args)
+            self.assertEqual(args[-1], 'about:blank')
             self.assertFalse(process.call_args.kwargs['shell'])
             p.chromium.connect_over_cdp.assert_called_once_with('ws://127.0.0.1:9222/devtools/browser/fixture-id', timeout=1200)
 

@@ -4,10 +4,14 @@ No browser automation, remote debugging, cookie export or CAPTCHA solving.
 This prepares a local profile; it does not connect the rental provider.
 """
 import argparse
+import http.client
+import json
 import os
 from pathlib import Path
+import re
 import subprocess
 import sys
+from urllib.parse import urlsplit
 
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -15,6 +19,39 @@ BROWSERS = {
     'chrome': ('Google Chrome', 'chrome.exe', Path('Google/Chrome/Application/chrome.exe')),
     'edge': ('Microsoft Edge', 'msedge.exe', Path('Microsoft/Edge/Application/msedge.exe')),
 }
+
+
+class ProfileInCheckMode(Exception):
+    pass
+
+
+def profile_in_check_mode(profile):
+    """Identify a still-running debug instance of this isolated profile only.
+
+    Closing Edge windows can leave its process alive. A second launch would
+    reuse that process and ignore new command-line arguments. Never describe
+    that reused instance as a fresh manual browser.
+    """
+    connection = None
+    try:
+        lines = (Path(profile) / 'DevToolsActivePort').read_text(encoding='utf-8').splitlines()
+        if (len(lines) != 2 or not lines[0].isdigit() or not 1 <= int(lines[0]) <= 65535
+                or not re.fullmatch(r'/devtools/browser/[A-Za-z0-9-]+', lines[1])):
+            return False
+        connection = http.client.HTTPConnection('127.0.0.1', int(lines[0]), timeout=0.8)
+        connection.request('GET', '/json/version')
+        response = connection.getresponse()
+        if response.status != 200:
+            return False
+        metadata = json.loads(response.read(8193))
+        endpoint = urlsplit(metadata.get('webSocketDebuggerUrl', ''))
+        return (endpoint.scheme == 'ws' and endpoint.hostname in ('127.0.0.1', 'localhost')
+                and endpoint.port == int(lines[0]) and endpoint.path == lines[1])
+    except (OSError, ValueError, TypeError, AttributeError, http.client.HTTPException):
+        return False
+    finally:
+        if connection:
+            connection.close()
 
 
 def registered_path(filename):
@@ -60,6 +97,8 @@ def profile_path(account_id, browser, root=ROOT):
 
 def launch_browser(executable, account_id, browser, root=ROOT):
     profile = profile_path(account_id, browser, root)
+    if profile_in_check_mode(profile):
+        raise ProfileInCheckMode()
     profile.mkdir(parents=True, exist_ok=True, mode=0o700)
     return subprocess.Popen([str(executable), '--user-data-dir=' + str(profile),
                              '--no-first-run', '--new-window', 'https://claude.ai/'],
@@ -96,6 +135,11 @@ def main(argv=None):
             print('Выбранный браузер не установлен.')
             return 2
         launch_browser(browsers[browser], account_id, browser)
+    except ProfileInCheckMode:
+        print('Этот профиль ещё открыт в режиме check, возможно в фоне.')
+        print('Полностью завершите именно тестовый браузер и повторите запуск manual.')
+        print('База и сохранённый профиль не удаляются. Код проверки: profile_still_in_check_mode.')
+        return 2
     except (ValueError, EOFError):
         print('Неверный ввод: нужен положительный ID аккаунта и номер браузера из списка.')
         return 2
