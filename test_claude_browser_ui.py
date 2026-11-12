@@ -65,6 +65,34 @@ class BrowserUsageTests(unittest.TestCase):
             with self.assertRaises(SettingsError):
                 read_usage(self.page)
 
+    def test_weekly_dropdown_with_svg_title_or_hidden_text(self):
+        for decoration in ('<svg width="16" height="16"><title>Expand menu</title><path d="M0 0 L8 8"/></svg>',
+                           '<span style="display:none">Choose limit</span>'):
+            with self.subTest(decoration=decoration):
+                self.load(self.usage('12%', '34%').replace('This week</button>',
+                                                         'This week' + decoration + '</button>'))
+                details = {}
+                self.assertEqual(read_usage(self.page, details), {'five_hour': 12, 'seven_day': 34})
+                self.assertEqual(details['weekly']['exact_text_matches'], 0)
+                self.assertEqual(details['weekly']['rendered_text_matches'], 1)
+                self.assertTrue(details['weekly']['percentage_read'])
+
+    def test_weekly_label_must_be_visible_exact_and_unique(self):
+        for replacement in ('This week remaining', 'This week 100% available',
+                            '<svg width="16" height="16"><title>This week</title></svg>'):
+            with self.subTest(replacement=replacement):
+                self.load(self.usage().replace('This week</button>', replacement + '</button>'))
+                with self.assertRaisesRegex(SettingsError, '^weekly_label_missing$'):
+                    read_usage(self.page)
+        self.load(self.usage() + '<section><button>This week</button><span>0% used</span></section>')
+        with self.assertRaisesRegex(SettingsError, '^weekly_label_ambiguous$'):
+            read_usage(self.page)
+
+    def test_rendered_label_normalizes_line_breaks_and_nonbreaking_spaces(self):
+        for label in ('This&nbsp;week', 'This <span style="display:block">week</span>'):
+            self.load(self.usage('5%', '6%').replace('This week</button>', label + '</button>'))
+            self.assertEqual(read_usage(self.page), {'five_hour': 5, 'seven_day': 6})
+
     def test_duplicate_rows_and_both_zero_values_are_ambiguous(self):
         for html in (self.usage() + '<div>Current session</div><span>1%</span>',
                      '<main><p>Current session</p><p>This week</p><span>0%</span><span>0%</span></main>'):
@@ -144,6 +172,27 @@ class BrowserUsageTests(unittest.TestCase):
                 import json
                 self.assertNotIn(ORG, json.dumps(navigation))
                 self.assertNotIn('https:', json.dumps(navigation))
+
+    def test_entire_check_reads_decorated_weekly_label_and_returns_to_account(self):
+        self.html = self.tab_navigation_fixture().replace('This week</button>',
+            'This week<svg><title>Toggle menu</title></svg></button>')
+        details, navigation = {}, []
+        org, result = inspect_account(self.context, ORG, navigation=navigation, usage_diagnostics=details)
+        self.assertEqual((org, result['seven_day']), (ORG, 34))
+        self.assertEqual(details['weekly']['rendered_text_matches'], 1)
+        self.assertEqual(navigation[-1]['target'], 'account')
+        self.assertTrue(navigation[-1]['ready'])
+        self.assertEqual(self.context.pages, [self.page])
+
+    def test_failed_usage_check_keeps_page_and_reports_missing_metric(self):
+        self.html = self.tab_navigation_fixture().replace('This week', 'Unknown heading')
+        details = {}
+        with self.assertRaisesRegex(SettingsError, '^weekly_label_missing$'):
+            inspect_account(self.context, ORG, usage_diagnostics=details)
+        self.assertEqual(details['weekly']['rendered_text_matches'], 0)
+        self.assertTrue(details['session']['percentage_read'])
+        self.assertEqual(len(self.context.pages), 2)
+        self.assertEqual(self.context.pages[-1].url, USAGE_URL)
 
     def test_full_reload_fallback_when_settings_tabs_cannot_be_found(self):
         self.html = self.tab_navigation_fixture(('Unknown account label', 'Unknown usage label'))

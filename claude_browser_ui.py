@@ -46,8 +46,29 @@ def require_page(page, section):
         raise SettingsError('wrong_settings_page')
 
 
-def label_pattern(labels):
-    return re.compile(r'^\s*(?:' + '|'.join(re.escape(x) for x in labels) + r')\s*$', re.I)
+def label_pattern(labels, exact=True):
+    alternatives = r'(?:' + '|'.join(r'\s+'.join(re.escape(part) for part in label.split())
+                                     for label in labels) + r')'
+    return re.compile(r'^\s*' + alternatives + r'\s*$' if exact else alternatives, re.I)
+
+
+def visible_labels(page, labels, diagnostics=None):
+    """Match the entire rendered label, ignoring text in SVG titles/hidden nodes.
+
+    Playwright text locators include hidden descendant text. Use a broad query
+    only to find candidates, then require an exact innerText match. Never use
+    a substring alone to identify a usage row.
+    """
+    exact = label_pattern(labels)
+    candidates = page.get_by_text(label_pattern(labels, exact=False))
+    visible = [candidates.nth(i) for i in range(candidates.count()) if candidates.nth(i).is_visible()]
+    matched = [candidate for candidate in visible
+               if exact.fullmatch(' '.join(candidate.inner_text(timeout=3000).split()))]
+    if diagnostics is not None:
+        raw = page.get_by_text(exact)
+        diagnostics.update(partial_text_matches=len(visible), rendered_text_matches=len(matched),
+                           exact_text_matches=sum(raw.nth(i).is_visible() for i in range(raw.count())))
+    return matched
 
 
 def settings_tab(page, section):
@@ -69,8 +90,7 @@ def settings_tab(page, section):
 
 
 def unique_label(page, labels):
-    locator = page.get_by_text(label_pattern(labels))
-    visible = [locator.nth(i) for i in range(locator.count()) if locator.nth(i).is_visible()]
+    visible = visible_labels(page, labels)
     if len(visible) != 1:
         raise SettingsError('missing_or_ambiguous_label')
     return visible[0]
@@ -99,17 +119,24 @@ def row_text(label, pattern):
     raise SettingsError('missing_row_value')
 
 
-def read_usage(page):
+def read_usage(page, diagnostics=None):
     require_page(page, 'usage')
     values = {}
     for kind in ('session', 'weekly'):
-        text, value = row_text(unique_label(page, LABELS[kind]), PERCENT)
+        details = {}
+        if diagnostics is not None:
+            diagnostics[kind] = details
+        labels = visible_labels(page, LABELS[kind], details)
+        if len(labels) != 1:
+            raise SettingsError(kind + ('_label_missing' if not labels else '_label_ambiguous'))
+        text, value = row_text(labels[0], PERCENT)
         if REMAINING.search(text):
             raise SettingsError('remaining_is_not_used')
         number = float(value.replace(',', '.'))
         if not 0 <= number <= 100:
             raise SettingsError('invalid_percentage')
         values[kind] = number
+        details['percentage_read'] = True
     return {'five_hour': values['session'], 'seven_day': values['weekly']}
 
 

@@ -21,7 +21,7 @@ if __package__:
     from .claude_manual_login import ROOT, BROWSERS, installed_browsers, profile_path
 else:
     from claude_manual_login import ROOT, BROWSERS, installed_browsers, profile_path
-from claude_browser_ui import (ACCOUNT_URL, USAGE_URL, LABELS, SettingsError, label_pattern,
+from claude_browser_ui import (ACCOUNT_URL, USAGE_URL, LABELS, SettingsError, visible_labels,
                                settings_tab, read_organization, read_usage, global_logout_available)
 
 
@@ -29,7 +29,7 @@ class CheckError(Exception):
     pass
 
 
-TOOL_VERSION = '0.3.5'
+TOOL_VERSION = '0.3.6'
 
 
 class CheckReport:
@@ -145,8 +145,7 @@ def access_state(page):
 
 
 def visible_label_count(page, labels):
-    locator = page.get_by_text(label_pattern(labels))
-    return sum(locator.nth(i).is_visible() for i in range(locator.count()))
+    return len(visible_labels(page, labels))
 
 
 def navigation_state(page, target):
@@ -206,9 +205,10 @@ def visit_settings(page, url, labels, navigation=None):
     raise CheckError('settings_not_ready')
 
 
-def inspect_account(context, expected_organization=None, progress=None, navigation=None):
+def inspect_account(context, expected_organization=None, progress=None, navigation=None, usage_diagnostics=None):
     page = context.new_page()
     progress = progress or (lambda stage: None)
+    completed = False
     try:
         progress('reading_account')
         visit_settings(page, ACCOUNT_URL, LABELS['organization'], navigation)
@@ -222,7 +222,12 @@ def inspect_account(context, expected_organization=None, progress=None, navigati
         deadline = time.monotonic() + 8
         while True:
             try:
-                usage = read_usage(page)
+                state = access_state(page)
+                if state:
+                    raise CheckError(state)
+                if usage_diagnostics is not None:
+                    usage_diagnostics.clear()
+                usage = read_usage(page, usage_diagnostics)
                 break
             except SettingsError:
                 if time.monotonic() >= deadline:
@@ -232,13 +237,17 @@ def inspect_account(context, expected_organization=None, progress=None, navigati
         visit_settings(page, ACCOUNT_URL, LABELS['organization'], navigation)
         if read_organization(page) != organization:
             raise CheckError('account_changed_during_check')
+        completed = True
         return organization, {**usage, 'global_logout_button': logout,
                               'logout_tested': False, 'claude_code_revocation_tested': False}
     finally:
-        try:
-            page.close()
-        except Exception:
-            pass
+        # Keep the failed page visible for the owner to inspect. Successful
+        # checks still close only the tab they created.
+        if completed:
+            try:
+                page.close()
+            except Exception:
+                pass
 
 
 ERRORS = {
@@ -253,6 +262,10 @@ ERRORS = {
     'site_security_check': 'Сайт запросил проверку безопасности. Программная проверка остановлена. Закройте её и выполните проверку вручную через open_claude_manual.cmd. Повторные попытки автоматически не запускаются.',
     'settings_not_ready': 'Страница настроек не готова или её разметка изменилась. Сохраните код ошибки; нулевые лимиты не подставляются.',
     'ambiguous_settings_navigation': 'Открыто несколько диалогов или найдено несколько одинаковых пунктов настроек. Закройте дополнительные диалоги и повторите проверку.',
+    'session_label_missing': 'Не найдено название пятчасового лимита. Страница оставлена открытой; сохраните отчёт browser_check.json.',
+    'session_label_ambiguous': 'Найдено несколько строк пятчасового лимита. Страница оставлена открытой; сохраните отчёт browser_check.json.',
+    'weekly_label_missing': 'Не найдено название недельного лимита. Страница оставлена открытой; сохраните отчёт browser_check.json.',
+    'weekly_label_ambiguous': 'Найдено несколько строк недельного лимита. Страница оставлена открытой; сохраните отчёт browser_check.json.',
 }
 
 
@@ -270,6 +283,7 @@ def main():
     stage = 'starting'
     diagnostics = {}
     navigation = []
+    usage_diagnostics = {}
     try:
         report_file = CheckReport(root / 'storage/claude_rental/browser_check.json')
     except OSError:
@@ -303,14 +317,16 @@ def main():
         def progress(value):
             nonlocal stage
             stage = value
-            report_file.write('running', stage, account_id=account_id, connection=diagnostics, navigation=navigation)
+            report_file.write('running', stage, account_id=account_id, connection=diagnostics,
+                              navigation=navigation, usage_reading=usage_diagnostics)
         with sync_playwright() as p:
             progress('connecting_browser')
             connection = connect_profile(p, browsers[browser], profile, diagnostics)
             if len(connection.contexts) != 1:
                 raise CheckError('ambiguous_browser_context')
             organization, report = inspect_account(connection.contexts[0], binding.get('organization_id'),
-                                                   progress=progress, navigation=navigation)
+                                                   progress=progress, navigation=navigation,
+                                                   usage_diagnostics=usage_diagnostics)
         # All Playwright work has ended before console input. No background
         # stdin reader, nested browser waits or live automation during input.
         print(f'Лимиты прочитаны: {report["five_hour"]:g}% за 5 часов; {report["seven_day"]:g}% за неделю.')
@@ -324,7 +340,7 @@ def main():
         bindings[str(account_id)] = {'browser': browser, 'organization_id': organization}
         save_json(binding_path, bindings)
         report_file.write('ok', 'completed', account_id=account_id, connection=diagnostics,
-                          navigation=navigation, **report)
+                          navigation=navigation, usage_reading=usage_diagnostics, **report)
         print(f'Current session / за 5 часов: {report["five_hour"]:g}% использовано.')
         print(f'This week / за неделю: {report["seven_day"]:g}% использовано.')
         print('Кнопка глобального выхода: ' + ('найдена.' if report['global_logout_button'] else 'не найдена.'))
@@ -343,7 +359,8 @@ def main():
         # Never print Playwright exceptions, HTML, URLs or mailbox credentials.
         try:
             report_file.write('error', stage, code=code, account_id=account_id,
-                              connection=diagnostics, navigation=navigation, **safe_error_details(exc))
+                              connection=diagnostics, navigation=navigation,
+                              usage_reading=usage_diagnostics, **safe_error_details(exc))
         except OSError:
             pass
         return 1
