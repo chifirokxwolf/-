@@ -21,7 +21,7 @@ if __package__:
     from .claude_manual_login import ROOT, BROWSERS, installed_browsers, profile_path
 else:
     from claude_manual_login import ROOT, BROWSERS, installed_browsers, profile_path
-from claude_browser_ui import (ACCOUNT_URL, USAGE_URL, LABELS, SettingsError, visible_labels,
+from claude_browser_ui import (ACCOUNT_URL, USAGE_URL, LABELS, SettingsError, label_counts,
                                settings_tab, read_organization, read_usage, global_logout_available)
 
 
@@ -29,7 +29,7 @@ class CheckError(Exception):
     pass
 
 
-TOOL_VERSION = '0.4.1'
+TOOL_VERSION = '0.4.2'
 
 
 class CheckReport:
@@ -111,6 +111,17 @@ def connect_profile(playwright, executable, profile, diagnostics=None):
     if not profile.is_dir():
         raise CheckError('manual_profile_missing')
     diagnostics.update(port_file_present=(profile / 'DevToolsActivePort').exists(), connected=False)
+    # Reuse this profile's debug instance instead of adding about:blank windows
+    # on every retry. An unavailable/stale endpoint falls through to a new launch.
+    if diagnostics['port_file_present']:
+        try:
+            endpoint = local_endpoint(profile)
+            connection = playwright.chromium.connect_over_cdp(endpoint, timeout=1200)
+            diagnostics.update(connected=True, endpoint_readable=True, reused_browser=True)
+            return connection
+        except Exception:
+            pass
+    diagnostics['reused_browser'] = False
     process = subprocess.Popen([str(executable), '--user-data-dir=' + str(profile), '--no-first-run',
                       '--remote-debugging-address=127.0.0.1', '--remote-debugging-port=0',
                       'about:blank'],
@@ -141,20 +152,16 @@ def access_state(page):
     if (u.path.startswith(('/api/challenge_redirect', '/cdn-cgi/'))
             or re.fullmatch(r'\s*(Just a moment|Один момент)[.!…\s]*', page.title(), re.I)):
         return 'site_security_check'
+    if u.path.rstrip('/') == '/magic-link':
+        return 'login_link_failed'
     if u.path.rstrip('/') in ('/login', '/signup'):
         return 'sign_in_manually_first'
     return None
 
 
-def visible_label_count(page, labels):
-    return len(visible_labels(page, labels))
-
-
 def navigation_state(page, target):
-    # Fixed names and counts only: no page text, email, organization ID or URL.
     return {'fragment_matches': urlsplit(page.url).fragment == 'settings/' + target,
-            'visible_labels': {kind: visible_label_count(page, labels)
-                               for kind, labels in LABELS.items()}}
+            'visible_labels': label_counts(page)}
 
 
 def visit_settings(page, url, labels, navigation=None):
@@ -200,11 +207,27 @@ def visit_settings(page, url, labels, navigation=None):
         if state:
             raise CheckError(state)
         record.update(navigation_state(page, section))
-        if record['fragment_matches'] and visible_label_count(page, labels) == 1:
+        kind = next(key for key, value in LABELS.items() if value == labels)
+        if record['fragment_matches'] and record['visible_labels'][kind] == 1:
             record['ready'] = True
             return
         page.wait_for_timeout(200)
     raise CheckError('settings_not_ready')
+
+
+def wait_for_read(page, reader, timeout_seconds=8):
+    """Wait for async settings values; re-read a complete snapshot each attempt."""
+    deadline = time.monotonic() + timeout_seconds
+    while True:
+        state = access_state(page)
+        if state:
+            raise CheckError(state)
+        try:
+            return reader()
+        except SettingsError:
+            if time.monotonic() >= deadline:
+                raise
+            page.wait_for_timeout(200)
 
 
 def inspect_account(context, expected_organization=None, progress=None, navigation=None, usage_diagnostics=None):
@@ -214,30 +237,16 @@ def inspect_account(context, expected_organization=None, progress=None, navigati
     try:
         progress('reading_account')
         visit_settings(page, ACCOUNT_URL, LABELS['organization'], navigation)
-        organization = read_organization(page)
+        organization = wait_for_read(page, lambda: read_organization(page))
         if expected_organization and organization != expected_organization:
             raise CheckError('account_identity_mismatch')
         logout = global_logout_available(page)
         progress('reading_usage')
         visit_settings(page, USAGE_URL, LABELS['session'], navigation)
-        # A loading row is not a zero. Wait briefly for a complete, unambiguous view.
-        deadline = time.monotonic() + 8
-        while True:
-            try:
-                state = access_state(page)
-                if state:
-                    raise CheckError(state)
-                if usage_diagnostics is not None:
-                    usage_diagnostics.clear()
-                usage = read_usage(page, usage_diagnostics)
-                break
-            except SettingsError:
-                if time.monotonic() >= deadline:
-                    raise
-                page.wait_for_timeout(300)
+        usage = wait_for_read(page, lambda: read_usage(page, usage_diagnostics))
         progress('verifying_account')
         visit_settings(page, ACCOUNT_URL, LABELS['organization'], navigation)
-        if read_organization(page) != organization:
+        if wait_for_read(page, lambda: read_organization(page)) != organization:
             raise CheckError('account_changed_during_check')
         completed = True
         return organization, {**usage, 'global_logout_button': logout,
@@ -253,6 +262,14 @@ def inspect_account(context, expected_organization=None, progress=None, navigati
 
 
 ERRORS = {
+    'login_link_failed': 'Открыта страница входа по ссылке. Выполните ручной вход через claude_account.cmd → 1, запросив новое письмо. Проверка выполняется после входа.',
+    'organization_label_missing': 'Не найдена строка ID организации. Страница оставлена открытой; сохраните browser_check.json.',
+    'organization_label_ambiguous': 'Найдено несколько строк ID организации. Закройте дополнительные окна настроек и повторите проверку.',
+    'ambiguous_settings_dialog': 'Открыто несколько диалогов настроек. Закройте лишние диалоги и повторите проверку.',
+    'missing_row_value': 'Название строки найдено, но её значение не загрузилось. Нулевое значение не подставляется.',
+    'ambiguous_row': 'В строке найдено несколько значений или соседний лимит. Проверьте страницу и сохраните browser_check.json.',
+    'invalid_percentage': 'Значение лимита вне диапазона 0–100%. Результат отклонён.',
+    'remaining_is_not_used': 'Найден остаток лимита вместо использованного процента. Результат отклонён.',
     'cardinal_config_missing': 'Не найдены настройки Cardinal. Скопируйте tools рядом с main.py и откройте /claude_rental.',
     'cardinal_database_missing': 'Не найдена база аккаунтов Cardinal. Проверьте настройку database.',
     'account_not_found': 'Такого ID нет в базе Cardinal. Посмотрите ID в меню «Аккаунты».',

@@ -112,6 +112,60 @@ class BrowserLogoutTests(unittest.TestCase):
         self.html('Log out everywhere', direct=True)
         self.assertTrue(self.perform())
 
+    def test_russian_global_label_with_separate_logout_button(self):
+        html = """<body data-revoked="0"><span data-testid="account">fixture@example.org</span>
+            <section role="dialog"><h2>Аккаунт</h2>
+            <div style="display:flex;justify-content:space-between"><span>Выйти на всех устройствах</span>
+            <button onclick="document.querySelector('#confirm').showModal()">Выйти</button></div>
+            <button onclick="document.body.dataset.deleted='1'">Удалить аккаунт</button></section>
+            <dialog id="confirm"><button onclick="document.body.dataset.revoked='1';this.parentElement.close()">Выйти</button></dialog>"""
+        self.context.route('**/*',lambda r:r.fulfill(status=200,content_type='text/html; charset=utf-8',body=html))
+        self.page.goto('https://claude.ai/new#settings/account')
+        self.assertTrue(self.perform())
+        self.assertIsNone(self.page.locator('body').get_attribute('data-deleted'))
+
+    def test_orphan_global_heading_cannot_select_an_unrelated_local_logout(self):
+        html = """<span data-testid="account">fixture@example.org</span><section role="dialog">
+            <section><p>Выйти на всех устройствах</p><p>Not currently available</p></section>
+            <section><button onclick="document.body.dataset.local='1'">Выйти</button></section></section>"""
+        self.context.route('**/*',lambda r:r.fulfill(status=200,content_type='text/html; charset=utf-8',body=html))
+        self.page.goto('https://claude.ai/new#settings/account')
+        with self.assertRaises(LogoutError):self.perform()
+        self.assertIsNone(self.page.locator('body').get_attribute('data-local'))
+
+    def test_confirmation_keeps_original_target_when_duplicate_is_inserted(self):
+        self.html('Log out everywhere')
+        self.page.evaluate("""() => {
+            const button=document.querySelector('dialog button');
+            button.id='original-confirm';
+            const original=Element.prototype.getBoundingClientRect;
+            Element.prototype.getBoundingClientRect=function() {
+                const rect=original.call(this);
+                if(this.id==='original-confirm' && this.closest('dialog').open && !window.injected) {
+                    window.injected=true;
+                    queueMicrotask(()=>{
+                        const other=document.createElement('button');
+                        other.textContent=button.textContent;
+                        other.onclick=()=>document.body.dataset.wrong='1';
+                        button.before(other);
+                    });
+                }
+                return rect;
+            };
+        }""")
+        self.assertTrue(self.perform())
+        self.assertIsNone(self.page.locator('body').get_attribute('data-wrong'))
+
+    def test_direct_navigation_after_global_logout_is_verified(self):
+        html = """<span data-testid="account">fixture@example.org</span>
+            <button onclick="location.href='/login'">Log out everywhere</button>"""
+        def route(r):
+            body=html if '/login' not in r.request.url else '<input type="email">'
+            r.fulfill(status=200,content_type='text/html',body=body)
+        self.context.route('**/*',route)
+        self.page.goto('https://claude.ai/new#settings/account')
+        self.assertTrue(self.perform(verify=lambda ms:self.page.url=='https://claude.ai/login'))
+
     def test_wrong_origin_is_rejected(self):
         self.html('Log out everywhere')
         self.page.goto('https://unrelated.example/settings')

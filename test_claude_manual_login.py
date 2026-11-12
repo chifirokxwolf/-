@@ -84,18 +84,18 @@ class ManualLoginTests(unittest.TestCase):
                 patch.object(manual, 'launch_browser') as launch, redirect_stdout(io.StringIO()) as output:
             self.assertEqual(manual.main([]), 0)
             launch.assert_called_once_with(Path('chrome.exe'), 7, 'chrome')
-            self.assertIn('пока не подключены', output.getvalue())
+            self.assertIn('claude_account.cmd', output.getvalue())
 
     def test_download_bundle_contains_the_launcher_companion_and_instructions(self):
-        from build_plugin import build_manual_login
+        from build_plugin import build_manual_login, TOOL_FILES
         root = Path(__file__).resolve().parent
         archive = build_manual_login(root)
         with zipfile.ZipFile(archive) as z:
             self.assertIsNone(z.testzip())
-            self.assertEqual(set(z.namelist()), {'tools/claude_manual_login.py', 'tools/open_claude_manual.cmd',
-                                                'CLAUDE_MANUAL_LOGIN_RU.md'})
+            self.assertEqual(set(z.namelist()), set(TOOL_FILES) | {'tools/claude_browser_ui.py', 'tools/claude_browser_actions.py'})
             for name in z.namelist():
-                self.assertEqual(z.read(name), (root / name).read_bytes())
+                source = root / (Path(name).name if Path(name).name in ('claude_browser_ui.py','claude_browser_actions.py') else name)
+                self.assertEqual(z.read(name), source.read_bytes())
 
 
 if __name__ == '__main__':

@@ -92,7 +92,8 @@ def login_value(value):
         u = urlsplit(value)
         if (u.scheme == 'https' and u.hostname == 'claude.ai' and not u.username
                 and not u.password and u.port in (None, 443) and u.path not in ('', '/')
-                and u.query and not any(c.isspace() or ord(c) < 32 for c in value)):
+                and (u.query or (u.path.rstrip('/') == '/magic-link' and u.fragment))
+                and not any(c.isspace() or ord(c) < 32 for c in value)):
             return value
     except ValueError:
         pass

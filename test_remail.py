@@ -204,6 +204,16 @@ class MailboxTests(unittest.TestCase):
         with self.assertRaises(MailError):
             Mailbox(FakeClient([]), [])
 
+    def test_magic_link_fragment_is_preserved_and_other_fragments_rejected(self):
+        from remail import login_value, MailError
+        link = 'https://claude.ai/magic-link#fixture%2Btoken'
+        self.assertEqual(login_value(link),link)
+        self.assertEqual(extract_login({'body':'<a href="'+link+'">Sign in</a>'}),link)
+        for value in ('https://claude.ai/new#settings/account', 'https://claude.ai/magic-link#',
+                      'https://claude.ai.attacker.example/magic-link#fixture',
+                      'https://user@claude.ai/magic-link#fixture'):
+            with self.assertRaises(MailError):login_value(value)
+
     def test_extracts_html_link_and_preserves_leading_zero_code(self):
         self.assertEqual(extract_login(msg(1)), '012345')
         body = '<a href="https://claude.ai/magic?token=fixture&amp;state=x">Sign in</a>'

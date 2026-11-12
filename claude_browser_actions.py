@@ -35,8 +35,86 @@ def _pattern(labels):
     return re.compile(r'^\s*(?:' + '|'.join(re.escape(x) for x in labels) + r')\s*(?:…|\.\.\.)?\s*$', re.I)
 
 
-def _visible(locator):
-    return [locator.nth(i) for i in range(locator.count()) if locator.nth(i).is_visible()]
+LOCAL_LOGOUT_LABELS = ('Выйти', 'Log out', 'Sign out', 'Вийти', 'Abmelden',
+                       'Se déconnecter', 'Cerrar sesión', 'Sair', '退出', '登出', 'ログアウト', '로그아웃')
+
+
+def global_logout_target(page):
+    """Resolve a global button or the local button in its explicit, isolated row.
+
+    Return a pinned DOM element, not a positional locator. A detached element
+    fails rather than clicking the replacement at the same index.
+    """
+    from claude_browser_ui import _RENDERER
+    handle = page.evaluate_handle(r'''(labels) => {
+        const r = (''' + _RENDERER + r''')();
+        const norm = s => r.normalize(s).replace(/(?:…|\.\.\.)$/, '').trim().toLowerCase();
+        const global = new Set(labels.global.map(norm)), local = new Set(labels.local.map(norm));
+        const dialogs = [...document.querySelectorAll('dialog,[role="dialog"],[role="alertdialog"]')].filter(r.visible);
+        if (dialogs.length > 1) return {error:true};
+        const root = dialogs[0] || document.body;
+        const elements = [...root.querySelectorAll('*')];
+        const buttons = elements.filter(el => el.matches('button,[role="button"]') && r.visible(el) && !el.disabled);
+        const candidates = new Set(buttons.filter(el => global.has(norm(r.text(el) || el.getAttribute('aria-label') || ''))));
+        const matches = elements.filter(el => r.visible(el) && global.has(norm(r.text(el) || el.getAttribute('aria-label') || '')));
+        const labelsOnly = matches.filter(el => !el.closest('button,[role="button"]') &&
+            !matches.some(other => other !== el && el.contains(other)));
+        for (const label of labelsOnly) {
+            for (let row = label.parentElement; row && row !== root; row = row.parentElement) {
+                const contained = buttons.filter(el => row.contains(el));
+                if (!contained.length) continue;
+                // A row must contain exactly this label and one logout button.
+                // Never pair an orphan heading with a logout elsewhere in Settings.
+                if (contained.length === 1 && local.has(norm(r.text(contained[0])))) {
+                    const target = contained[0], a = label.getBoundingClientRect(), b = target.getBoundingClientRect();
+                    const rest = r.normalize(r.text(row)).replace(r.normalize(r.text(label)), '')
+                        .replace(r.normalize(r.text(target)), '').trim();
+                    if (!rest && a.top < b.bottom && b.top < a.bottom) candidates.add(target);
+                }
+                break;
+            }
+        }
+        if (candidates.size > 1) return {error:true};
+        return candidates.size ? [...candidates][0] : null;
+    }''', {'global': [label for group in GLOBAL_LABELS.values() for label in group],
+           'local': list(LOCAL_LOGOUT_LABELS)})
+    element = handle.as_element()
+    if element is not None:
+        return element
+    try:
+        if handle.json_value() is not None:
+            raise LogoutError('A unique global logout button was not found; account remains held')
+        return None
+    finally:
+        handle.dispose()
+
+
+def confirmation_target(page, previous, labels):
+    from claude_browser_ui import _RENDERER
+    handle = page.evaluate_handle(r'''(args) => {
+        const r = (''' + _RENDERER + r''')();
+        const norm = s => r.normalize(s).replace(/(?:…|\.\.\.)$/, '').trim().toLowerCase();
+        const dialogs = [...document.querySelectorAll('dialog,[role="dialog"],[role="alertdialog"]')]
+            .filter(el => r.visible(el) && !args.previous.includes(el));
+        if (!dialogs.length) return null;
+        if (dialogs.length > 1) return {error:'multiple_dialogs'};
+        const names = new Set(args.labels.map(norm));
+        const buttons = [...dialogs[0].querySelectorAll('button,[role="button"]')]
+            .filter(el => r.visible(el) && !el.disabled && names.has(norm(r.text(el) || el.getAttribute('aria-label') || '')));
+        return buttons.length === 1 ? buttons[0] : {error:'ambiguous_confirmation'};
+    }''', {'previous': previous, 'labels': list(labels)})
+    element = handle.as_element()
+    if element is not None:
+        return element
+    try:
+        value = handle.json_value()
+        if value is not None:
+            if value.get('error') == 'multiple_dialogs':
+                raise LogoutError('Multiple confirmation dialogs; account remains held')
+            raise LogoutError('A unique logout confirmation was not found; account remains held')
+        return None
+    finally:
+        handle.dispose()
 
 
 def logout_everywhere(page, *, verify_account, verify_revoked, timeout_ms=10000):
@@ -51,20 +129,23 @@ def logout_everywhere(page, *, verify_account, verify_revoked, timeout_ms=10000)
     Playwright is optional: this module is imported without launching a browser.
     """
     labels = tuple(x for values in GLOBAL_LABELS.values() for x in values)
+    target = None
+    confirm = None
+    existing_dialogs = []
     try:
         url = urlsplit(page.url)
-        if url.scheme != 'https' or url.hostname != 'claude.ai' or url.port not in (None, 443) or url.username:
+        if url.scheme != 'https' or url.hostname != 'claude.ai' or url.port not in (None, 443) or url.username or url.password:
             raise LogoutError('Unexpected settings origin')
         if not callable(verify_account) or not callable(verify_revoked) or verify_account(page) is not True:
             raise LogoutError('Account identity was not confirmed')
         if not 100 <= timeout_ms <= 60000:
             raise LogoutError('Invalid browser timeout')
-        dialogs = page.get_by_role('dialog').or_(page.get_by_role('alertdialog'))
-        existing_dialogs = [d.element_handle() for d in _visible(dialogs)]
-        buttons = _visible(page.get_by_role('button', name=_pattern(labels)))
-        if len(buttons) != 1:
+        existing_dialogs = page.locator('dialog:visible,[role="dialog"]:visible,[role="alertdialog"]:visible').element_handles()
+        target = global_logout_target(page)
+        if target is None:
             raise LogoutError('A unique global logout button was not found; account remains held')
-        buttons[0].click(timeout=timeout_ms)
+        before_url = page.url
+        target.click(timeout=timeout_ms)
         # A direct logout may have no modal. If a modal appears, scope the confirm
         # search to it so a local logout elsewhere on the page can never be clicked.
         try:
@@ -73,24 +154,25 @@ def logout_everywhere(page, *, verify_account, verify_revoked, timeout_ms=10000)
                     getComputedStyle(el).visibility !== 'hidden')''', arg=existing_dialogs,
                 timeout=min(1500, timeout_ms))
         except Exception as exc:
-            if type(exc).__name__ != 'TimeoutError':
+            if type(exc).__name__ != 'TimeoutError' and page.url == before_url:
                 raise
-        # The screenshot's Settings window is itself a dialog. Only a newly
-        # opened confirmation may receive the second click.
-        visible = [d for d in _visible(dialogs)
-                   if d.evaluate('(el, previous) => !previous.includes(el)', existing_dialogs)]
-        if len(visible) > 1:
-            raise LogoutError('Multiple confirmation dialogs; account remains held')
-        if visible:
-            confirm = _visible(visible[0].get_by_role('button', name=_pattern(labels + CONFIRM_LABELS)))
-            if len(confirm) != 1:
-                raise LogoutError('A unique logout confirmation was not found; account remains held')
-            confirm[0].click(timeout=timeout_ms)
+        # Resolve and pin the new confirmation in one browser task as well.
+        if page.url == before_url:
+            confirm = confirmation_target(page, existing_dialogs, labels + CONFIRM_LABELS)
+            if confirm is not None:
+                confirm.click(timeout=timeout_ms)
         if verify_revoked(timeout_ms) is not True:
             raise LogoutError('Logout was clicked but revocation was not confirmed; account remains held')
         return True
     except LogoutError:
         raise
-    except Exception:
-        # Browser errors can contain URLs, HTML, account data and session tokens.
-        raise LogoutError('Browser action failed; account remains held') from None
+    except Exception as exc:
+        # Only the fixed exception class, never URLs, HTML or session values.
+        raise LogoutError('Browser action failed (' + type(exc).__name__ + '); account remains held') from None
+    finally:
+        for handle in [target, confirm, *existing_dialogs]:
+            if handle is not None:
+                try:
+                    handle.dispose()
+                except Exception:
+                    pass

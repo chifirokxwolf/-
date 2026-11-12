@@ -8,8 +8,9 @@ if not exist "tools\claude_browser_ui.py" goto missing
 if not exist "tools\claude_browser_actions.py" goto missing
 if not exist "tools\claude_manual_login.py" goto missing
 python tools\claude_account_check.py
+set "CLAUDE_TOOL_EXIT=%errorlevel%"
 pause
-exit /b
+exit /b %CLAUDE_TOOL_EXIT%
 :missing
 echo ERROR: Extract the entire ZIP and copy its tools folder into Cardinal.
 pause

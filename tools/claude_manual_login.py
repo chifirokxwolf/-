@@ -1,6 +1,7 @@
 """Manual Claude login in an installed Windows browser with a separate profile.
 
-No browser automation, remote debugging, cookie export or CAPTCHA solving.
+Manual launch does not enable remote debugging or automate sign-in.
+Recovery can close this profile's existing debug browser with owner confirmation.
 This prepares a local profile; it does not connect the rental provider.
 """
 import argparse
@@ -11,6 +12,7 @@ from pathlib import Path
 import re
 import subprocess
 import sys
+import time
 from urllib.parse import urlsplit
 
 
@@ -52,6 +54,38 @@ def profile_in_check_mode(profile):
     finally:
         if connection:
             connection.close()
+
+
+def close_check_profile(profile):
+    """Gracefully close only the debug browser identified by this profile's file.
+
+    The caller asks for confirmation first. Never terminate all Chrome/Edge
+    processes, delete cookies or modify a personal browser profile.
+    """
+    profile = Path(profile)
+    if not profile_in_check_mode(profile):
+        return
+    lines = (profile / 'DevToolsActivePort').read_text(encoding='utf-8').splitlines()
+    if (len(lines) != 2 or not lines[0].isdigit() or not 1 <= int(lines[0]) <= 65535
+            or not re.fullmatch(r'/devtools/browser/[A-Za-z0-9-]+', lines[1])):
+        raise RuntimeError('invalid_local_endpoint')
+    endpoint = 'ws://127.0.0.1:' + lines[0] + lines[1]
+    from playwright.sync_api import sync_playwright
+    with sync_playwright() as p:
+        browser = p.chromium.connect_over_cdp(endpoint, timeout=3000)
+        session = browser.new_browser_cdp_session()
+        try:
+            session.send('Browser.close')
+        except Exception:
+            # Browser.close can close its own transport before returning.
+            # Success is determined by the profile's endpoint becoming inactive.
+            pass
+    deadline = time.monotonic() + 5
+    while profile_in_check_mode(profile):
+        if time.monotonic() >= deadline:
+            raise RuntimeError('profile_still_in_check_mode')
+        time.sleep(0.2)
+    time.sleep(0.2)  # Allow Chromium to flush the profile and release its file lock.
 
 
 def registered_path(filename):
@@ -136,10 +170,23 @@ def main(argv=None):
             return 2
         launch_browser(browsers[browser], account_id, browser)
     except ProfileInCheckMode:
-        print('Этот профиль ещё открыт в режиме check, возможно в фоне.')
-        print('Полностью завершите именно тестовый браузер и повторите запуск manual.')
-        print('База и сохранённый профиль не удаляются. Код проверки: profile_still_in_check_mode.')
-        return 2
+        print('Этот профиль остался открыт в режиме проверки.')
+        print(f'Можно закрыть только тестовый {BROWSERS[browser][0]} аккаунта #{account_id} и открыть ручной вход.')
+        print('Сохраните незавершённый текст в его вкладках. Личные профили и база не затрагиваются.')
+        try:
+            answer = input('Закрыть тестовый браузер и открыть ручной вход? ДА / Enter для отмены: ').strip().casefold()
+            if answer not in ('да', 'yes'):
+                return 1
+            close_check_profile(profile_path(account_id, browser))
+            launch_browser(browsers[browser], account_id, browser)
+        except (KeyboardInterrupt, EOFError):
+            return 1
+        except ImportError:
+            print('Для закрытия режима проверки запустите setup_claude_check.cmd, затем повторите ручной вход.')
+            return 2
+        except Exception:
+            print('Не удалось закрыть тестовый браузер. Закройте его окна и повторите запуск. Данные профиля сохранены.')
+            return 2
     except (ValueError, EOFError):
         print('Неверный ввод: нужен положительный ID аккаунта и номер браузера из списка.')
         return 2
@@ -152,7 +199,8 @@ def main(argv=None):
     print(f'Запущен {BROWSERS[browser][0]} для аккаунта #{account_id}.')
     print('Войдите в Claude вручную. Это отдельный профиль: личные вкладки и cookies не используются.')
     print('После входа закройте окно браузера крестиком, затем повторите запуск с тем же ID и браузером.')
-    print('Профиль сохраняется на этом компьютере. Автовыдача, лимиты и авто-выход пока не подключены.')
+    print('Профиль сохраняется на этом компьютере. После входа закройте его окна и выполните проверку через claude_account.cmd → 2.')
+    print('Запросите новое письмо здесь; полную ссылку, включая часть после #, вставьте в это же окно.')
     print('При повторной проверке Cloudflare используйте ссылку устранения неполадок на самой странице.')
     return 0
 

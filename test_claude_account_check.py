@@ -81,21 +81,29 @@ class AccountCheckTests(unittest.TestCase):
                 with self.assertRaises(check.CheckError):
                     check.local_endpoint(profile)
 
-    def test_native_connection_is_local_and_does_not_copy_cookies(self):
+    def test_existing_debug_browser_is_reused_without_another_blank_window(self):
         with tempfile.TemporaryDirectory() as folder, patch.object(check.subprocess, 'Popen') as process:
             profile = Path(folder)
             (profile / 'DevToolsActivePort').write_text('9222\n/devtools/browser/fixture-id')
-            p = Mock()
-            connection = check.connect_profile(p, Path('msedge.exe'), profile)
+            p = Mock(); diagnostics = {}
+            connection = check.connect_profile(p, Path('msedge.exe'), profile, diagnostics)
             self.assertIs(connection, p.chromium.connect_over_cdp.return_value)
+            process.assert_not_called()
+            self.assertTrue(diagnostics['reused_browser'])
+            p.chromium.connect_over_cdp.assert_called_once_with('ws://127.0.0.1:9222/devtools/browser/fixture-id', timeout=1200)
+
+    def test_native_connection_starts_loopback_debugging_when_no_endpoint_exists(self):
+        with tempfile.TemporaryDirectory() as folder, patch.object(check.subprocess, 'Popen') as process:
+            profile = Path(folder)
+            process.side_effect = lambda *a, **kw: (profile / 'DevToolsActivePort').write_text('9222\n/devtools/browser/fixture-id')
+            p = Mock(); diagnostics = {}
+            check.connect_profile(p, Path('msedge.exe'), profile, diagnostics)
             args = process.call_args.args[0]
             self.assertIn('--remote-debugging-address=127.0.0.1', args)
             self.assertIn('--remote-debugging-port=0', args)
             self.assertIn('--user-data-dir=' + str(profile), args)
-            self.assertNotIn('--new-window', args)
-            self.assertEqual(args[-1], 'about:blank')
             self.assertFalse(process.call_args.kwargs['shell'])
-            p.chromium.connect_over_cdp.assert_called_once_with('ws://127.0.0.1:9222/devtools/browser/fixture-id', timeout=1200)
+            self.assertFalse(diagnostics['reused_browser'])
 
     def test_account_lookup_is_read_only_and_does_not_return_pickup_token(self):
         with tempfile.TemporaryDirectory() as folder, patch.dict(check.os.environ, {}, clear=True):

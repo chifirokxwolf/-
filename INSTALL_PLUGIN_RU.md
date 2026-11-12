@@ -1,7 +1,11 @@
-# Claude Rental 0.4.1 для FunPay Cardinal 0.1.17.15
+# Claude Rental 0.4.2 для FunPay Cardinal 0.1.17.15
 
-В 0.4.1 исправлено чтение недельной строки с видимым `This week` и скрытым
-текстом выпадающего списка. Обновите всю папку tools из архива, чтобы версия
+Для версии 0.4.2 используйте `tools/claude_account.cmd`: пункт 1 — ручной вход,
+пункт 2 — проверка. [Обновление и восстановление браузера](UPDATE_0.4.2_RU.txt).
+
+
+В 0.4.2 устранены позиционные обращения к изменяющейся странице.
+Поддерживаются недельная строка `This week`, русский интерфейс и лимиты 0–100%. Обновите всю папку tools из архива, чтобы версия
 проверки и модуль чтения совпадали. Базу и профили удалять не требуется.
 
 
@@ -35,8 +39,8 @@
 
 ## Скачать и установить
 
-- [ZIP с плагином и инструкцией](https://github.com/chifirokxwolf/-/raw/refs/heads/claude-rental-weekly-fix-0.4.1/dist/claude-rental-plugin-0.4.1.zip).
-- [Готовый Python-файл](https://github.com/chifirokxwolf/-/raw/refs/heads/main/dist/claude_rental_plugin.py).
+- [ZIP с плагином и инструкцией](https://github.com/chifirokxwolf/-/raw/refs/heads/claude-rental-stability-0.4.2/dist/claude-rental-plugin-0.4.2.zip).
+- [Готовый Python-файл](https://github.com/chifirokxwolf/-/raw/refs/heads/claude-rental-stability-0.4.2/dist/claude_rental_plugin.py).
 
 1. Сохраните резервную копию `storage/claude_rental/` при остановленном Cardinal.
 2. Распакуйте ZIP. Нужный файл — **`plugins/claude_rental_plugin.py`**.
@@ -44,7 +48,7 @@
    `/upload_plugin` и отправьте этот `.py` как документ с прежним именем.
    ZIP целиком команда не принимает. При обновлении замените прежний файл.
 4. Выполните `/restart`, затем **`/claude_rental`**.
-5. В заголовке должно быть **Claude Rental 0.4.1**. Меню также доступно через
+5. В заголовке должно быть **Claude Rental 0.4.2**. Меню также доступно через
    **Плагины → Claude Rental → Настройки**.
 
 Можно заменить файл вручную в папке `plugins/` при остановленном Cardinal.

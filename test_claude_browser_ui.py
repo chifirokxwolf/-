@@ -138,7 +138,7 @@ class BrowserUsageTests(unittest.TestCase):
                 self.load(self.usage().replace('This week</button>', replacement + '</button>'))
                 with self.assertRaisesRegex(SettingsError, '^weekly_label_missing$'):
                     read_usage(self.page)
-        self.load(self.usage() + '<section><button>This week</button><span>0% used</span></section>')
+        self.load(self.usage().replace('<p>Usage credits', '<section><button>This week</button><span>0% used</span></section><p>Usage credits'))
         with self.assertRaisesRegex(SettingsError, '^weekly_label_ambiguous$'):
             read_usage(self.page)
 
@@ -148,7 +148,7 @@ class BrowserUsageTests(unittest.TestCase):
             self.assertEqual(read_usage(self.page), {'five_hour': 5, 'seven_day': 6})
 
     def test_duplicate_rows_and_both_zero_values_are_ambiguous(self):
-        for html in (self.usage() + '<div>Current session</div><span>1%</span>',
+        for html in (self.usage().replace('<p>Usage credits', '<div>Current session</div><span>1%</span><p>Usage credits'),
                      '<main><p>Current session</p><p>This week</p><span>0%</span><span>0%</span></main>'):
             self.load(html)
             with self.assertRaises(SettingsError):
@@ -260,7 +260,7 @@ class BrowserUsageTests(unittest.TestCase):
         for extra in ('<button>Usage</button>',
                       '<section role="alertdialog"><button>Log out of all devices</button></section>'):
             self.load(self.tab_navigation_fixture().replace('</nav>', extra + '</nav>'), ACCOUNT_URL)
-            with self.assertRaisesRegex(SettingsError, '^ambiguous_settings_navigation$'):
+            with self.assertRaisesRegex(SettingsError, '^ambiguous_settings_(navigation|dialog)$'):
                 check.visit_settings(self.page, USAGE_URL, LABELS['session'])
             self.assertEqual(self.page.url, ACCOUNT_URL)
             self.assertIsNone(self.page.locator('body').get_attribute('data-clicked'))
