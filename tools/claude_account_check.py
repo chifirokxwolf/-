@@ -29,13 +29,15 @@ class CheckError(Exception):
     pass
 
 
-TOOL_VERSION = '0.4.0'
+TOOL_VERSION = '0.4.1'
 
 
 class CheckReport:
     def __init__(self, path):
         self.path = path
-        self.base = {'tool_version': TOOL_VERSION, 'run_id': uuid.uuid4().hex,
+        self.base = {'tool_version': TOOL_VERSION,
+                     'reader_version': getattr(sys.modules[read_usage.__module__], 'READER_VERSION', 'legacy'),
+                     'run_id': uuid.uuid4().hex,
                      'started_at': datetime.now(timezone.utc).isoformat()}
         self.write('running', 'starting')
 

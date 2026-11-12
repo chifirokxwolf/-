@@ -77,6 +77,60 @@ class BrowserUsageTests(unittest.TestCase):
                 self.assertEqual(details['weekly']['rendered_text_matches'], 1)
                 self.assertTrue(details['weekly']['percentage_read'])
 
+    def test_weekly_dropdown_rendered_dom_variants(self):
+        clipped = 'position:absolute;width:1px;height:1px;margin:-1px;overflow:hidden;clip:rect(0,0,0,0)'
+        variants = (
+            'This week<span style="display:none">This week</span>',
+            f'This week<span style="{clipped}">Open menu</span>',
+            f'This week<span style="{clipped}">This week</span>',
+            'This week<svg width="16" height="16"><title>This week</title></svg>',
+            '<span style="display:inline-flex;gap:4px"><span>This</span><span>week</span></span>',
+            'This week<span aria-hidden="true">⌄</span>',
+            'This\u200b week',
+            '<span style="display:contents">This week</span>',
+        )
+        for label in variants:
+            with self.subTest(label=label):
+                self.load(self.usage('15%', '22%').replace('This week</button>', label + '</button>'))
+                details = {}
+                self.assertEqual(read_usage(self.page, details), {'five_hour': 15, 'seven_day': 22})
+                self.assertEqual(details['weekly']['rendered_text_matches'], 1)
+
+    def test_visible_native_selector_reads_only_selected_option(self):
+        label = '<select><option>Current session</option><option selected>This week</option></select>'
+        self.load(self.usage('15%', '22%').replace('<button>This week</button>', label))
+        self.assertEqual(read_usage(self.page), {'five_hour': 15, 'seven_day': 22})
+
+    def test_screenshot_layout_reads_15_and_22_with_extra_usage_rows(self):
+        weekly = '<div><button><span>This week<span style="display:none">This week</span></span><svg width="16" height="16"><title>Expand</title></svg></button></div>'
+        html = self.usage('15%', '22%').replace('<button>This week</button>', weekly)
+        html += '<h2>Limit resets</h2><p>No resets right now</p><section>Other model <span>55%</span></section><section>Extra usage <span>0%</span></section>'
+        self.load(html)
+        self.assertEqual(read_usage(self.page), {'five_hour': 15, 'seven_day': 22})
+
+    def test_screen_reader_percentage_is_not_a_second_visible_value(self):
+        hidden = '<span style="position:absolute;clip-path:inset(50%);width:1px;height:1px;overflow:hidden">22%</span>'
+        self.load(self.usage('15%', '22%').replace('22% used', '22% used' + hidden))
+        self.assertEqual(read_usage(self.page), {'five_hour': 15, 'seven_day': 22})
+
+    def test_hidden_only_weekly_label_and_visible_qualifiers_are_rejected(self):
+        variants = (
+            '<span style="position:absolute;clip:rect(0,0,0,0);width:1px;height:1px">This week</span>',
+            '<span aria-hidden="true">This week remaining</span>',
+            '<span style="opacity:0">This week</span>',
+            '<select aria-hidden="true" style="width:1px;height:1px;clip-path:inset(50%)"><option>This week</option></select>',
+        )
+        for label in variants:
+            with self.subTest(label=label):
+                self.load(self.usage('15%', '22%').replace('This week</button>', label + '</button>'))
+                with self.assertRaisesRegex(SettingsError, '^weekly_label_missing$'):
+                    read_usage(self.page)
+
+    def test_missing_session_percentage_cannot_borrow_weekly_value(self):
+        self.load(self.usage('15%', '22%').replace('15% used', 'Loading'))
+        with self.assertRaisesRegex(SettingsError, 'ambiguous_row|missing_row_value'):
+            read_usage(self.page)
+
     def test_weekly_label_must_be_visible_exact_and_unique(self):
         for replacement in ('This week remaining', 'This week 100% available',
                             '<svg width="16" height="16"><title>This week</title></svg>'):

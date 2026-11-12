@@ -18,7 +18,7 @@ from types import ModuleType
 from email.utils import parseaddr
 
 NAME = 'Claude Rental'
-VERSION = '0.4.0'
+VERSION = '0.4.1'
 DESCRIPTION = 'Аренда Claude: браузерный авто-кик по сроку, аккаунты и Remail. Для выдачи нужен адаптер.'
 CREDITS = 'Local development'
 UUID = '52280b60-3fd9-4df7-9eb3-f1bb1cd337ef'

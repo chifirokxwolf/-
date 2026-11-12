@@ -52,21 +52,90 @@ def label_pattern(labels, exact=True):
     return re.compile(r'^\s*' + alternatives + r'\s*$' if exact else alternatives, re.I)
 
 
-def visible_labels(page, labels, diagnostics=None):
-    """Match the entire rendered label, ignoring text in SVG titles/hidden nodes.
+# Use rendered DOM text rather than Playwright's text selector: its deepest-match
+# rule can discard a visible button when a hidden child repeats the same label.
+# Clipped accessibility text and SVG titles are not screen-visible labels/values.
+READER_VERSION = '0.4.1'
+_RENDERER = r'''() => {
+    const styles = new WeakMap(), visibility = new WeakMap(), texts = new WeakMap();
+    const style = el => {
+        if (!styles.has(el)) styles.set(el, getComputedStyle(el));
+        return styles.get(el);
+    };
+    const normalize = text => text.replace(/[\u200b-\u200d\u2060\ufeff\u00ad]/g, '')
+        .replace(/\s+/g, ' ').trim();
+    function visible(el) {
+        if (!el || el.nodeType !== 1) return false;
+        if (visibility.has(el)) return visibility.get(el);
+        const s = style(el), rect = el.getBoundingClientRect();
+        const clip = s.clip.match(/-?\d+(?:\.\d+)?/g);
+        const clipped = s.clip !== 'auto' && clip && clip.length === 4 &&
+            (+clip[2] <= +clip[0] || +clip[1] <= +clip[3]);
+        const clippedPath = /^inset\(\s*50%(?:\s+50%){0,3}\s*\)$/.test(s.clipPath);
+        const tinyClipped = rect.width <= 1 && rect.height <= 1 &&
+            (s.overflow === 'hidden' || s.clipPath !== 'none');
+        const own = !['SCRIPT', 'STYLE', 'NOSCRIPT', 'SVG', 'TITLE', 'OPTION'].includes(el.tagName.toUpperCase()) &&
+            s.display !== 'none' && s.visibility !== 'hidden' && s.visibility !== 'collapse' &&
+            Number(s.opacity) !== 0 && !clipped && !clippedPath && !tinyClipped &&
+            (el.getClientRects().length > 0 || s.display === 'contents');
+        const result = own && (!el.parentElement || visible(el.parentElement));
+        visibility.set(el, result);
+        return result;
+    }
+    function text(el) {
+        if (texts.has(el)) return texts.get(el);
+        if (!visible(el)) return '';
+        const s = style(el);
+        let value;
+        if (el.tagName === 'SELECT') {
+            value = el.selectedOptions.length === 1 ? el.selectedOptions[0].textContent : '';
+        } else if (el.getAttribute('aria-hidden') === 'true' &&
+                   /^[\s⌄⌃▾▴▼▲∨∧›‹»«]+$/.test(el.textContent)) {
+            value = ''; // Decorative arrow, not arbitrary aria-hidden words.
+        } else {
+            const parts = [...el.childNodes].map(node => {
+                if (node.nodeType === 3) return node.textContent;
+                if (node.nodeType !== 1) return '';
+                if (node.tagName === 'BR') return ' ';
+                const value = text(node), display = style(node).display;
+                return ['block', 'flex', 'grid', 'list-item'].includes(display) ? ' ' + value + ' ' : value;
+            });
+            const separated = ['flex', 'inline-flex', 'grid', 'inline-grid'].includes(s.display) && parseFloat(s.columnGap) > 0;
+            value = parts.join(separated ? ' ' : '');
+        }
+        texts.set(el, value);
+        return value;
+    }
+    return {text, visible, normalize};
+}'''
 
-    Playwright text locators include hidden descendant text. Use a broad query
-    only to find candidates, then require an exact innerText match. Never use
-    a substring alone to identify a usage row.
+
+def rendered_text(locator):
+    return locator.evaluate('(el) => { const r = (' + _RENDERER + ')(); return r.normalize(r.text(el)); }')
+
+
+def visible_labels(page, labels, diagnostics=None):
+    """Find exact visible labels, deduplicating wrappers around the same label.
+
+    Scan the DOM independently of get_by_text so hidden copies cannot suppress
+    their visible parent. Match the complete cleaned label, never a substring.
+    Unknown labels and multiple actual rows still fail closed.
     """
-    exact = label_pattern(labels)
-    candidates = page.get_by_text(label_pattern(labels, exact=False))
-    visible = [candidates.nth(i) for i in range(candidates.count()) if candidates.nth(i).is_visible()]
-    matched = [candidate for candidate in visible
-               if exact.fullmatch(' '.join(candidate.inner_text(timeout=3000).split()))]
+    elements = page.locator('body *')
+    indices = elements.evaluate_all('''(elements, labels) => {
+        const r = (''' + _RENDERER + ''')();
+        const expected = new Set(labels.map(label => r.normalize(label).toLowerCase()));
+        const matches = elements.map((el, index) => ({el, index}))
+            .filter(({el}) => r.visible(el) && expected.has(r.normalize(r.text(el)).toLowerCase()));
+        return matches.filter(({el}) => !matches.some(other => other.el !== el && el.contains(other.el)))
+            .map(({index}) => index);
+    }''', list(labels))
+    matched = [elements.nth(i) for i in indices]
     if diagnostics is not None:
-        raw = page.get_by_text(exact)
-        diagnostics.update(partial_text_matches=len(visible), rendered_text_matches=len(matched),
+        raw = page.get_by_text(label_pattern(labels))
+        partial = page.get_by_text(label_pattern(labels, exact=False))
+        diagnostics.update(partial_text_matches=sum(partial.nth(i).is_visible() for i in range(partial.count())),
+                           rendered_text_matches=len(matched), reader_version=READER_VERSION,
                            exact_text_matches=sum(raw.nth(i).is_visible() for i in range(raw.count())))
     return matched
 
@@ -96,18 +165,22 @@ def unique_label(page, labels):
     return visible[0]
 
 
-def row_text(label, pattern):
+def row_text(label, pattern, other_labels=(), expected_labels=()):
     """Find the smallest visible parent containing exactly one value.
 
     Multiple values are an ambiguity even if numerically identical. Never
     deduplicate two 0% rows or interpret the page's 100% available summary.
     """
     scope = label
-    label_text = label.inner_text(timeout=3000)
+    label_text = rendered_text(label)
+    if expected_labels and not label_pattern(expected_labels).fullmatch(label_text):
+        raise SettingsError('label_changed_during_read')
     for _ in range(6):
         if scope.count() != 1:
             break
-        text = scope.inner_text(timeout=3000)
+        text = rendered_text(scope)
+        if other_labels and label_pattern(other_labels, exact=False).search(text):
+            raise SettingsError('ambiguous_row')
         # Adjacent inline spans can produce "Organization ID0000..." in
         # innerText even when CSS visually separates the columns.
         values = pattern.findall(text.replace(label_text, '\n', 1))
@@ -129,7 +202,8 @@ def read_usage(page, diagnostics=None):
         labels = visible_labels(page, LABELS[kind], details)
         if len(labels) != 1:
             raise SettingsError(kind + ('_label_missing' if not labels else '_label_ambiguous'))
-        text, value = row_text(labels[0], PERCENT)
+        other = LABELS['weekly' if kind == 'session' else 'session']
+        text, value = row_text(labels[0], PERCENT, other_labels=other, expected_labels=LABELS[kind])
         if REMAINING.search(text):
             raise SettingsError('remaining_is_not_used')
         number = float(value.replace(',', '.'))
@@ -142,7 +216,7 @@ def read_usage(page, diagnostics=None):
 
 def read_organization(page):
     require_page(page, 'account')
-    _, value = row_text(unique_label(page, LABELS['organization']), ORG_ID)
+    _, value = row_text(unique_label(page, LABELS['organization']), ORG_ID, expected_labels=LABELS['organization'])
     return value.lower()
 
 

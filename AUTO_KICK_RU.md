@@ -1,10 +1,10 @@
-# Авто-кик Claude Rental 0.4.0
+# Авто-кик Claude Rental 0.4.1
 
 Установите `plugins/claude_rental_plugin.py` через `/upload_plugin` и перезапустите
 Cardinal. Перед обновлением остановите Cardinal и сохраните резервную копию
 `storage/claude_rental/`. Не удаляйте базу и сохранённые профили браузера.
 
-На Windows распакуйте `claude-rental-plugin-0.4.0.zip` в папку Cardinal.
+На Windows распакуйте `claude-rental-plugin-0.4.1.zip` в папку Cardinal.
 В архиве плагин и обновлённые tools. Для работы только плагина достаточно одного
 Python-файла, но старую привязку профиля нужно обновить инструментом проверки.
 
